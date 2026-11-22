@@ -26,12 +26,15 @@ from calendar import timegm
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from time import strptime
-from typing import Iterable, Iterator
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
 from kernel_ai.ml.collectors.base import ALLOWED_SYSCALLS, SyscallEvent
 from kernel_ai.ml.normal_dataset import hour_files, iter_lines, load_cgroups
 from kernel_ai.ml.sequence import NgramTracker, StideModel
 from kernel_ai.ml.sequence_deep.markov import comm_context, unit_context
+
+if TYPE_CHECKING:
+    from kernel_ai.ml.exclusions import Window, WindowIndex
 
 STAGE4_GRID = (0.10, 0.20, 0.30, 0.40, 0.55)
 STAGE8_GRID = (4.0, 5.0, 6.0, 6.5, 7.0, 7.5, 8.0, 9.0)
@@ -98,22 +101,54 @@ def to_event(
         return None
 
 
+def _unit(obj: dict, cgroups: dict[int, str], cache: dict[int, str | None]) -> str | None:
+    try:
+        cid = int(obj.get("cgroup_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    if cid not in cache:
+        path = cgroups.get(cid)
+        cache[cid] = unit_context(path) if path is not None else None
+    return cache[cid]
+
+
 def iter_dataset_events(
-    root: str, days: list[str] | None, *, context: str = "comm"
+    root: str,
+    days: list[str] | None,
+    *,
+    context: str = "comm",
+    exclude: "WindowIndex | None" = None,
+    on_excluded: Callable[["Window", dict, bytes, str], None] | None = None,
 ) -> Iterator[ReplayEvent]:
+    """Events of the recorded days, minus those inside an alert window.
+
+    ``exclude`` drops every event an alert window covers (see
+    :mod:`kernel_ai.ml.exclusions`); ``on_excluded`` gets each dropped event
+    with its raw line, so the cut can be kept as a labelled trace.
+    """
     maps: dict[str, dict[int, str]] = {}
+    units: dict[int, str | None] = {}
     for path in hour_files(root, days=days):
         day = str(path.parent)
         if day not in maps:
-            maps[day] = load_cgroups(day) if context == "unit" else {}
+            maps[day] = load_cgroups(day) if context == "unit" or exclude is not None else {}
+            # cgroup ids are directory inodes, valid only against their own day's map.
+            units = {}
         for line in iter_lines(path):
             try:
                 obj = json.loads(line)
             except ValueError:
                 continue
             ev = to_event(obj, context=context, cgroups=maps[day]) if isinstance(obj, dict) else None
-            if ev is not None:
-                yield ev
+            if ev is None:
+                continue
+            if exclude is not None:
+                hit = exclude.match(ev.ts, ev.pid, _unit(obj, maps[day], units))
+                if hit is not None:
+                    if on_excluded is not None:
+                        on_excluded(hit, obj, line, day)
+                    continue
+            yield ev
 
 
 def _fresh(entries, marks: dict[int, int], stamps: dict[int, int]):
@@ -375,6 +410,7 @@ def main() -> None:
     ap.add_argument("--attacks", nargs="*", default=[], help="attack trace .jsonl files")
     ap.add_argument("--context", choices=("comm", "unit"), default="comm",
                     help="Stage 8 context key (unit needs cgroups.json per day)")
+    ap.add_argument("--exclude", help="alerts JSON from `exclusions fetch`: replay without their windows")
     args = ap.parse_args()
 
     cfg = MLConfig()
@@ -388,10 +424,21 @@ def main() -> None:
         if not deep.ready:
             raise SystemExit(f"Markov artifact not usable: {args.markov}")
 
-    res = replay(
-        iter_dataset_events(args.data, args.days, context=args.context), cfg, stide=stide, deep=deep
+    index = None
+    excluded: Counter = Counter()
+    if args.exclude:
+        from kernel_ai.ml.exclusions import WindowIndex
+
+        index = WindowIndex.from_alerts(args.exclude)
+    events = iter_dataset_events(
+        args.data, args.days, context=args.context, exclude=index,
+        on_excluded=lambda w, *_: excluded.update(w.labels[:1]),
     )
+    res = replay(events, cfg, stide=stide, deep=deep)
     summary = summarize(res, cfg)
+    if index is not None:
+        summary["excluded"] = {"windows": len(index), "events": sum(excluded.values()),
+                               "by_label": dict(excluded.most_common())}
     if args.attacks:
         summary["attacks"] = score_traces(
             args.attacks, cfg, stide=stide, deep=deep, context=args.context

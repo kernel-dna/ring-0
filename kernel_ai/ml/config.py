@@ -103,6 +103,14 @@ class MLConfig:
     # Require a minimum -decision_function before emit; live weak hits were
     # 0.05–0.09, real-looking ones 0.11+.
     if_min_score: float = _env_float("KERNEL_AI_ML_IF_MIN_SCORE", 0.10)
+    # Whether Stage 1 / Stage 2 verdicts are written to ml_anomalies. Off, both
+    # still score, and one log line per stage12_log_every_sec says what they would
+    # have written. On PROD (48 h to 2026-11-21) they wrote 4479 of 4527 anomalies,
+    # none for a polygon scenario, and their 'high' rows left 0 of 85701 snapshots
+    # past the retrain poison guard — Stage 2 could not be retrained at all.
+    stage1_emit: bool = os.getenv("KERNEL_AI_ML_STAGE1_EMIT", "true").lower() == "true"
+    stage2_emit: bool = os.getenv("KERNEL_AI_ML_STAGE2_EMIT", "true").lower() == "true"
+    stage12_log_every_sec: float = _env_float("KERNEL_AI_ML_STAGE12_LOG_EVERY_SEC", 300.0)
 
     # --- Stage 3 (drift + auto-retrain) ---
     # Window of recent snapshots used to measure drift (minutes).

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import Counter
 from pathlib import Path
 
 import joblib
@@ -88,6 +89,7 @@ def train_markov_from_dataset(
     *,
     context: str | None,
     ctx_prior: float = 20.0,
+    exclude: str | None = None,
 ) -> dict:
     """Fit Stage 8 on a frozen normal dataset (kernel-ai-normal-recorder days).
 
@@ -95,20 +97,26 @@ def train_markov_from_dataset(
     reconstructs from its per-pid windows — so training and scoring see the
     same alphabet and the same adjacency. ``context`` ("comm" or "unit", see
     :mod:`kernel_ai.ml.replay`) keys each transition by the process as well.
+    ``exclude`` is an alerts file from ``exclusions fetch``: events inside its
+    windows are not learned as normal.
     """
+    from kernel_ai.ml.exclusions import WindowIndex
     from kernel_ai.ml.replay import iter_dataset_events
 
+    index = WindowIndex.from_alerts(exclude) if exclude else None
+    excluded: Counter = Counter()
     markov = MarkovScorer(
         order=1,
         ctx_prior=ctx_prior,
         meta={"stage": 8, "source": f"normal-dataset:{','.join(days or ['all'])}",
-              "context": context},
+              "context": context, "excluded_windows": len(index) if index else 0},
     )
     encoder = SequenceEncoder()
     last: dict[int, str] = {}
     seen: set[str] = set()
     events = 0
-    for ev in iter_dataset_events(root, days, context=context or "comm"):
+    for ev in iter_dataset_events(root, days, context=context or "comm", exclude=index,
+                                  on_excluded=lambda w, *_: excluded.update(w.labels[:1])):
         events += 1
         if ev.syscall not in seen:
             seen.add(ev.syscall)
@@ -124,6 +132,8 @@ def train_markov_from_dataset(
     return {
         "source": markov.meta["source"],
         "events": events,
+        "excluded_events": sum(excluded.values()),
+        "excluded_by_label": dict(excluded.most_common(10)),
         "n_transitions": markov._total,
         "states": len(markov._counts),
         "contexts": len(markov._ctx_counts),
