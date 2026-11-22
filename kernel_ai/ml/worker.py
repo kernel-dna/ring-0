@@ -150,6 +150,7 @@ class MLWorker:
         self.model = None
         self._model_mtime: float | None = None
         self._last_if_emit = 0.0
+        self._reset_held(time.time())
         self._maybe_load_model()
 
         # Stage 4 (syscall sequence / STIDE). Source is selectable:
@@ -695,12 +696,41 @@ class MLWorker:
     def stop(self, *_args) -> None:
         self._running = False
 
+    def _reset_held(self, now: float) -> None:
+        self._held_s1: dict[str, int] = {}
+        self._held_s2 = 0
+        self._held_s2_max = 0.0
+        self._last_held_log = now
+
+    def _report_held(self, now: float) -> None:
+        """Log what Stage 1/2 would have written while their writes are off."""
+        if self.cfg.stage1_emit and self.cfg.stage2_emit:
+            return
+        if now - self._last_held_log < self.cfg.stage12_log_every_sec:
+            return
+        top = sorted(self._held_s1.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        logger.info(
+            "Stage 1/2 not emitted (last %.0fs): stage1=%d [%s] stage2=%d max_if_score=%.3f",
+            now - self._last_held_log,
+            sum(self._held_s1.values()),
+            ",".join(f"{name}:{n}" for name, n in top),
+            self._held_s2,
+            self._held_s2_max,
+        )
+        self._reset_held(now)
+
     def _tick(self) -> int:
         features = self.extractor.collect()
         if not features:
             return 0
         scores = self.baseline.update_and_score(features, self._min_std)
-        anomalies = _build_anomalies(scores, self.cfg)
+        stage1 = _build_anomalies(scores, self.cfg)
+        if self.cfg.stage1_emit:
+            anomalies = stage1
+        else:
+            anomalies = []
+            for row in stage1:
+                self._held_s1[row["feature"]] = self._held_s1.get(row["feature"], 0) + 1
 
         # Stage 2 second opinion: the forest can catch unusual *combinations*
         # the per-feature z-score misses. Rate-limited so a sustained anomaly
@@ -717,8 +747,13 @@ class MLWorker:
                 and if_score >= self.cfg.if_min_score
                 and (now - self._last_if_emit) >= self.cfg.if_cooldown_sec
             ):
-                anomalies.append(_build_isoforest_anomaly(if_score, scores, self.cfg))
+                if self.cfg.stage2_emit:
+                    anomalies.append(_build_isoforest_anomaly(if_score, scores, self.cfg))
+                else:
+                    self._held_s2 += 1
+                    self._held_s2_max = max(self._held_s2_max, if_score)
                 self._last_if_emit = now
+        self._report_held(time.time())
 
         # Stage 4 second opinion: anomalous *ordering* of syscalls.
         if self.cfg.enable_stage4:
@@ -789,9 +824,10 @@ class MLWorker:
             logger.info("restored baseline state for %d features", len(restored))
 
         logger.info(
-            "ML worker started: interval=%.1fs window=%d warmup=%d z_warn=%.1f z_crit=%.1f",
+            "ML worker started: interval=%.1fs window=%d warmup=%d z_warn=%.1f z_crit=%.1f "
+            "stage1_emit=%s stage2_emit=%s",
             self.cfg.interval_sec, self.cfg.baseline_window, self.cfg.warmup_samples,
-            self.cfg.z_warn, self.cfg.z_crit,
+            self.cfg.z_warn, self.cfg.z_crit, self.cfg.stage1_emit, self.cfg.stage2_emit,
         )
 
         ticks = 0
