@@ -119,11 +119,17 @@ class CgroupMap:
     needs to know which unit an event came from, so the mapping is captured
     at record time or never. Unknown ids trigger a rescan, rate-limited, and
     an id a rescan could not resolve is not retried.
+
+    Given the event's pid, an unknown id is first looked up in
+    ``/proc/<pid>/cgroup``: two syscalls instead of a tree walk, so a job's
+    scope that lives a few seconds is named before it goes away, which the
+    rescan limit could not do.
     """
 
     def __init__(self, cgroup_root: str = "/sys/fs/cgroup", *, min_rescan_sec: float = 10.0,
-                 clock=time.time) -> None:
+                 clock=time.time, proc_root: str = "/proc") -> None:
         self.cgroup_root = cgroup_root
+        self.proc_root = proc_root
         self.min_rescan_sec = min_rescan_sec
         self.clock = clock
         self._known: dict[int, str] = {}
@@ -153,10 +159,32 @@ class CgroupMap:
                 continue
         self._known.setdefault(_root_inode(self.cgroup_root), "")
 
-    def observe(self, cgroup_id: int) -> None:
+    def _from_proc(self, cgroup_id: int, pid: int) -> str | None:
+        try:
+            with open(f"{self.proc_root}/{pid}/cgroup", "rb") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            if line.startswith(b"0::/"):
+                path = line[4:].decode("utf-8", "replace")
+                # The process may have moved since the event: only the event's
+                # own directory has the id as its inode.
+                try:
+                    if os.stat(os.path.join(self.cgroup_root, path)).st_ino != cgroup_id:
+                        return None
+                except OSError:
+                    return None
+                self._known[cgroup_id] = path
+                return path
+        return None
+
+    def observe(self, cgroup_id: int, pid: int | None = None) -> None:
         if cgroup_id in self.seen or cgroup_id in self._unresolved:
             return
         path = self._known.get(cgroup_id)
+        if path is None and pid:
+            path = self._from_proc(cgroup_id, pid)
         if path is None:
             now = self.clock()
             if self._last_scan is not None and now - self._last_scan < self.min_rescan_sec:
@@ -343,7 +371,7 @@ class HourlyRecorder:
         if self.cgroups is not None:
             cid = _int_field(line, b'"cgroup_id":')
             if cid is not None:
-                self.cgroups.observe(cid)
+                self.cgroups.observe(cid, _int_field(line, b'"pid":'))
         if now - self._last_flush >= self.flush_sec:
             self._fh.flush()
             self._last_flush = now
