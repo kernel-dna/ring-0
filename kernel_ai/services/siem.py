@@ -24,6 +24,8 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 
+from kernel_ai.services import kernel_events as _kernel_events
+
 # PROD default; local/dev can override with KERNEL_AI_ES_ENV_FILE or export
 # KERNEL_AI_ES_URL / KERNEL_AI_ES_API_KEY directly (no file required).
 _ENV_PATH = os.environ.get("KERNEL_AI_ES_ENV_FILE", "/etc/kernel-ai/elastic.env")
@@ -168,12 +170,35 @@ def _normalize_hit(hit: dict) -> dict:
         "method": _flat(src, "http.request.method"),
         "status": _flat(src, "http.response.status_code"),
         "dataset": _flat(src, "event.dataset"),
+        # ``time`` is when the rule ran, up to two minutes after the attack itself
+        "event_time": _flat(src, "kibana.alert.original_time"),
         "tactic": mitre["tactic"],
         "tactic_id": mitre["tactic_id"],
         "technique": mitre["technique"],
         "technique_name": mitre["technique_name"],
         "position": _position_for(mitre, rule, ip),
     }
+
+
+# The alert list stops at ``limit``, and 2026-11-20 alone held 6 413 alerts, so
+# only a histogram covers the whole window.
+_TIMELINE_MIN = 15
+_SEVERITY_ORDER = ("low", "medium", "high", "critical")
+
+
+def _timeline(res: dict) -> dict:
+    buckets = ((res.get("aggregations") or {}).get("timeline") or {}).get("buckets") or []
+    out = []
+    for b in buckets:
+        sev = {s.get("key"): s.get("doc_count", 0) for s in (b.get("sev") or {}).get("buckets") or []}
+        top = ((b.get("rule") or {}).get("buckets") or [{}])[0]
+        out.append({
+            "time": b.get("key_as_string"),
+            "count": int(b.get("doc_count") or 0),
+            "severity": max((s for s in sev if s in _SEVERITY_ORDER), key=_SEVERITY_ORDER.index, default="medium"),
+            "rule": top.get("key"),
+        })
+    return {"interval_min": _TIMELINE_MIN, "buckets": out}
 
 
 def _empty(hours: int, reason: str = "") -> dict:
@@ -186,6 +211,7 @@ def _empty(hours: int, reason: str = "") -> dict:
         "by_severity": {},
         "by_tactic": {},
         "alerts": [],
+        "timeline": {"interval_min": _TIMELINE_MIN, "buckets": []},
         "reason": reason,
     }
 
@@ -223,6 +249,7 @@ def get_siem_alerts(hours: int = 24, limit: int = 120) -> dict:
         },
         "_source": [
             "@timestamp",
+            "kibana.alert.original_time",
             "kibana.alert.rule.name",
             "kibana.alert.severity",
             "kibana.alert.risk_score",
@@ -234,6 +261,19 @@ def get_siem_alerts(hours: int = 24, limit: int = 120) -> dict:
             "http.response.status_code",
             "event.dataset",
         ],
+        "aggs": {
+            "timeline": {
+                "date_histogram": {
+                    "field": "@timestamp",
+                    "fixed_interval": f"{_TIMELINE_MIN}m",
+                    "min_doc_count": 1,
+                },
+                "aggs": {
+                    "sev": {"terms": {"field": "kibana.alert.severity", "size": 4}},
+                    "rule": {"terms": {"field": "kibana.alert.rule.name", "size": 1}},
+                },
+            }
+        },
     }
 
     try:
@@ -246,6 +286,10 @@ def get_siem_alerts(hours: int = 24, limit: int = 120) -> dict:
     total = total_obj.get("value", len(hits)) if isinstance(total_obj, dict) else len(hits)
 
     alerts = [_normalize_hit(h) for h in hits]
+    captured = _kernel_events.fragment_sizes()
+    for a in alerts:
+        if a["id"] in captured:
+            a["fragment"] = captured[a["id"]]
 
     by_sev: dict = {}
     by_tactic: dict = {}
@@ -263,6 +307,7 @@ def get_siem_alerts(hours: int = 24, limit: int = 120) -> dict:
         "by_severity": by_sev,
         "by_tactic": by_tactic,
         "alerts": alerts,
+        "timeline": _timeline(res),
     }
 
     with _cache_lock:

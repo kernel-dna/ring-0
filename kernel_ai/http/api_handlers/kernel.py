@@ -78,12 +78,22 @@ def kernel_events():
         limit = request.args.get("limit", default=80, type=int)
         if since_seq is None or limit is None:
             raise ValueError("since_seq and limit must be integers")
+        stream = request.args.get("stream", "latency").strip()
+        alert = request.args.get("alert", "").strip()
+        if alert:
+            if stream != "security":
+                raise ValueError("alert fragments come from the security stream")
+            return {
+                "timestamp": datetime.now().isoformat(),
+                **kernel_events_service.get_alert_fragment(alert),
+            }
         return {
             "timestamp": datetime.now().isoformat(),
             **kernel_events_service.get_kernel_events(
                 pids=pids,
                 since_seq=since_seq,
                 limit=limit,
+                stream=stream,
             ),
         }
 
