@@ -87,17 +87,70 @@ def kernel_events():
                 "timestamp": datetime.now().isoformat(),
                 **kernel_events_service.get_alert_fragment(alert),
             }
-        return {
+        raw_mine = request.args.get("mine", "").strip()
+        mine = []
+        if raw_mine:
+            try:
+                mine = [int(value) for value in raw_mine.split(",") if value.strip()]
+            except ValueError as error:
+                raise ValueError("mine must be comma-separated ports") from error
+        if len(mine) > 32 or not all(0 < port < 65536 for port in mine):
+            raise ValueError("mine takes at most 32 ports, each 1-65535")
+        raw_conns = request.args.get("conns", "").strip()
+        conns = []
+        if raw_conns:
+            try:
+                conns = [int(value) for value in raw_conns.split(",") if value.strip()]
+            except ValueError as error:
+                raise ValueError("conns must be comma-separated ports") from error
+        if len(conns) > 8 or not all(0 < port < 65536 for port in conns):
+            raise ValueError("conns takes at most 8 ports, each 1-65535")
+        you_conn = _connection_port() if stream == "security" else None
+        payload = {
             "timestamp": datetime.now().isoformat(),
             **kernel_events_service.get_kernel_events(
                 pids=pids,
                 since_seq=since_seq,
                 limit=limit,
                 stream=stream,
+                mine=mine,
+                conns=conns + [you_conn] if you_conn else conns,
             ),
         }
+        you = _loopback_port() if stream == "security" else None
+        if you:
+            payload["you"] = you
+        if you_conn:
+            payload["you_conn"] = you_conn
+        return payload
 
     return api_json(_payload, exception_statuses=[(ValueError, 400)])
+
+
+def _connection_port():
+    """The port the requester's connection reached nginx from, which nginx passes on
+    as X-Client-Port: the peer of nginx's accept of that connection. Only nginx sets
+    it, so it is read only on a request that came over loopback."""
+    if request.environ.get("REMOTE_ADDR") not in ("127.0.0.1", "::1"):
+        return None
+    raw = request.headers.get("X-Client-Port", "").strip()
+    if not (raw.isascii() and raw.isdigit() and len(raw) <= 5):
+        return None
+    port = int(raw)
+    return port if 0 < port < 65536 else None
+
+
+def _loopback_port():
+    """The port this request reached the app from, when that was over loopback:
+    behind nginx, the local port of nginx's connect for this one request, which is
+    the hop the security stream marks once the page sends it back as mine."""
+    if request.environ.get("REMOTE_ADDR") not in ("127.0.0.1", "::1"):
+        return None
+    try:
+        port = int(request.environ.get("REMOTE_PORT") or 0)
+    except ValueError:
+        return None
+    return port if 0 < port < 65536 else None
 
 
 def socket_activity():

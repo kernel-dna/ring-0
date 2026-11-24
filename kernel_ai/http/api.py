@@ -22,6 +22,7 @@ from kernel_ai.http.api_handlers.kernel import (
     syscalls_realtime,
     wakeups,
 )
+from kernel_ai.http.api_handlers.genome import syscall_genome
 from kernel_ai.http.api_handlers.network_system import (
     active_connections,
     devices_realtime,
@@ -117,6 +118,7 @@ __all__ = [
     "siem_alerts",
     "socket_activity",
     "syscall_detail",
+    "syscall_genome",
     "syscalls_realtime",
     "traceroute_info",
     "wakeups",

@@ -47,7 +47,8 @@ def get_process_fds(pid):
 
 
 def get_process_lineage(pid):
-    return api_json(lambda: _process_inspect_service.get_process_lineage_info(pid))
+    traits = request.args.get("traits") == "1"
+    return api_json(lambda: _process_inspect_service.get_process_lineage_info(pid, traits=traits))
 
 
 def get_process_activity(pid):
