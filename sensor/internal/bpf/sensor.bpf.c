@@ -31,6 +31,21 @@ struct user_pt_regs {
 #define MAX_INFLIGHT 32768
 #define RING_BYTES (8 * 1024 * 1024)
 #define MAX_PEERS 4096
+#define ARG_BYTES 128
+#define MAX_ARG_INFLIGHT 4096
+/* Above the highest number either ABI has assigned (462 in 6.8); the x32 bit
+   and the -1 of a call the tracer cancelled both land outside it. */
+#define MAX_SYSCALL_NR 512
+#define MAX_CGROUPS 512
+
+/* What capture_args asks to copy out of user memory. Must match the argKind
+   constants in cmd/kernel-ai-sensor. */
+#define ARG_PATH0 1     /* NUL-terminated string at args[0]: execve */
+#define ARG_PATH1 2     /* NUL-terminated string at args[1]: execveat */
+#define ARG_SOCKADDR1 3 /* struct sockaddr at args[1], length args[2]: connect, bind */
+/* struct sockaddr the kernel writes at args[1], its length at *args[2]:
+   accept, accept4. Read at sys_exit and published as ARG_SOCKADDR1. */
+#define ARG_SOCKADDR1_OUT 4
 
 /* Wire offsets into the IPv4 header, fixed by RFC 791. These address packet
    bytes rather than a kernel struct, so they are stable and need no CO-RE. */
@@ -70,6 +85,7 @@ struct inflight_value {
     __u32 pid;
     __u32 uid;
     __u32 nr;
+    __u16 lport;
 };
 
 struct wakeup_value {
@@ -97,10 +113,35 @@ struct sensor_event {
     __u32 waker_tid;
     __u32 target_cpu;
     __u8 has_wakeup;
-    __u8 _pad[7];
+    __u8 _pad0;
+    __u16 lport;
+    __u8 _pad1[4];
     char comm[TASK_COMM_LEN];
     char waker_comm[TASK_COMM_LEN];
+    __u32 ppid;
+    __u16 arg_kind;
+    __u16 arg_len;
+    __u8 arg[ARG_BYTES];
 };
+
+/* Copied at sys_enter because a successful execve replaces the address space
+   the filename pointer points into: by sys_exit it no longer exists. start_ns
+   pairs the copy with its own call, since a call that never reaches sys_exit
+   leaves its copy behind for the next call on that tid. */
+struct arg_value {
+    __u64 start_ns;
+    __u16 kind;
+    __u16 len;
+    __u8 _pad[4];
+    __u8 data[ARG_BYTES];
+};
+
+/* Only real_parent->tgid is read, relocated against the running kernel's BTF
+   like sk_buff below. */
+struct task_struct {
+    struct task_struct *real_parent;
+    __s32 tgid;
+} __attribute__((preserve_access_index));
 
 /* Only the two fields the TTL read needs, declared partially and with
    preserve_access_index so libbpf relocates them against the running kernel.
@@ -112,9 +153,15 @@ struct sk_buff {
     unsigned char *head;
 } __attribute__((preserve_access_index));
 
-/* Never dereferenced: tcp_v4_conn_request takes it as its first argument, and
-   the probe only needs the second. */
-struct sock;
+/* Only the local port, host order. skc_num sits in an anonymous struct inside
+   sock_common; libbpf matches the name through it. */
+struct sock_common {
+    __u16 skc_num;
+} __attribute__((preserve_access_index));
+
+struct sock {
+    struct sock_common __sk_common;
+} __attribute__((preserve_access_index));
 
 struct peer_distance {
     __u64 last_ns;
@@ -157,6 +204,24 @@ struct {
     __type(value, __u8);
 } ignored_tgids SEC(".maps");
 
+/* nr -> ARG_* kind. Filled by userspace, which knows the syscall numbers of
+   the architecture it was built for. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 32);
+    __type(key, __u32);
+    __type(value, __u8);
+} capture_args SEC(".maps");
+
+/* LRU so that copies orphaned by calls that never returned age out instead of
+   filling the map. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_ARG_INFLIGHT);
+    __type(key, __u32);
+    __type(value, struct arg_value);
+} inflight_args SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -181,12 +246,92 @@ struct {
     __type(value, struct peer_distance);
 } peer_distance SEC(".maps");
 
+/* Every call a cgroup has made, by number, since the sensor first saw the
+   cgroup: which calls a unit uses at all, the set a seccomp filter is written
+   against. A count rather than an event because the stream classes trace two
+   dozen numbers and this one has to see all of them; read by userspace on an
+   interval like peer_distance. LRU so that cgroups of finished sessions make
+   room for new ones. */
+struct syscall_set {
+    __u64 calls[MAX_SYSCALL_NR];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_CGROUPS);
+    __type(key, __u64);
+    __type(value, struct syscall_set);
+} syscall_sets SEC(".maps");
+
+/* Never written: the zeroed value a new cgroup starts from, since four
+   kilobytes do not fit on the 512-byte BPF stack. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct syscall_set);
+} syscall_set_blank SEC(".maps");
+
 static __always_inline void count_drop(void)
 {
     __u32 key = 0;
     __u64 *value = bpf_map_lookup_elem(&drops, &key);
     if (value)
         __sync_fetch_and_add(value, 1);
+}
+
+static __always_inline void capture_arg(__u32 tid, __u8 kind, __u64 start_ns,
+                                        const __u64 *args)
+{
+    struct arg_value value;
+    __builtin_memset(&value, 0, sizeof(value));
+    value.start_ns = start_ns;
+    value.kind = kind;
+    long copied = 0;
+    if (kind == ARG_PATH0) {
+        copied = bpf_probe_read_user_str(value.data, sizeof(value.data),
+                                         (const void *)args[0]);
+    } else if (kind == ARG_PATH1) {
+        copied = bpf_probe_read_user_str(value.data, sizeof(value.data),
+                                         (const void *)args[1]);
+    } else if (kind == ARG_SOCKADDR1) {
+        __u32 len = (__u32)args[2];
+        /* sa_family alone is two bytes; anything shorter is not an address. */
+        if (len < 2)
+            return;
+        if (len > ARG_BYTES - 1)
+            len = ARG_BYTES - 1;
+        /* The 5.15 verifier loses the clamp above and rejects the read as
+           possibly negative. The mask restores a bound it can see; the empty
+           asm stops clang from proving the mask redundant and dropping it. */
+        asm volatile("" : "+r"(len));
+        len &= ARG_BYTES - 1;
+        if (bpf_probe_read_user(value.data, len, (const void *)args[1]) == 0)
+            copied = len;
+    }
+    if (copied <= 0)
+        return;
+    value.len = (__u16)copied;
+    bpf_map_update_elem(&inflight_args, &tid, &value, BPF_ANY);
+}
+
+/* accept and accept4 learn the peer only as they return: the address is read
+   at sys_exit from the buffer the kernel has just filled. */
+static __always_inline void capture_peer(struct sensor_event *event, const __u64 *args)
+{
+    __u32 len = 0;
+    if (!args[1] || !args[2])
+        return;
+    if (bpf_probe_read_user(&len, sizeof(len), (const void *)args[2]) != 0 || len < 2)
+        return;
+    if (len > ARG_BYTES - 1)
+        len = ARG_BYTES - 1;
+    asm volatile("" : "+r"(len));
+    len &= ARG_BYTES - 1;
+    if (bpf_probe_read_user(event->arg, len, (const void *)args[1]) != 0)
+        return;
+    event->arg_kind = ARG_SOCKADDR1;
+    event->arg_len = (__u16)len;
 }
 
 SEC("tracepoint/raw_syscalls/sys_enter")
@@ -209,6 +354,10 @@ int trace_sys_enter(struct sys_enter_ctx *ctx)
     value.nr = nr;
     __builtin_memcpy(value.args, ctx->args, sizeof(value.args));
     bpf_map_update_elem(&inflight, &tid, &value, BPF_ANY);
+
+    __u8 *kind = bpf_map_lookup_elem(&capture_args, &nr);
+    if (kind)
+        capture_arg(tid, *kind, value.start_ns, value.args);
     return 0;
 }
 
@@ -228,6 +377,21 @@ int trace_sched_wakeup(struct sched_wakeup_ctx *ctx)
     value.target_cpu = (__u32)ctx->target_cpu;
     bpf_get_current_comm(value.waker_comm, sizeof(value.waker_comm));
     bpf_map_update_elem(&wakeups, &wakee_tid, &value, BPF_ANY);
+    return 0;
+}
+
+/* The local port of a TCP connect, which the accepting side reads back as its
+   peer port: the one number both ends of a loopback hop share. tcp_connect
+   rather than the SYN_SENT state change, which tcp_v4_connect makes before
+   inet_hash_connect has picked the port. It runs in the caller's context
+   inside the call, so the port lands on that thread's call in flight. */
+SEC("kprobe/tcp_connect")
+int BPF_KPROBE(trace_tcp_connect, struct sock *sk)
+{
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+    struct inflight_value *started = bpf_map_lookup_elem(&inflight, &tid);
+    if (started)
+        started->lport = BPF_CORE_READ(sk, __sk_common.skc_num);
     return 0;
 }
 
@@ -266,6 +430,19 @@ int trace_sys_exit(struct sys_exit_ctx *ctx)
     event->nr = started->nr;
     event->has_wakeup = 0;
     bpf_get_current_comm(event->comm, sizeof(event->comm));
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    event->ppid = BPF_CORE_READ(task, real_parent, tgid);
+
+    struct arg_value *arg = bpf_map_lookup_elem(&inflight_args, &tid);
+    if (arg && arg->start_ns == started->start_ns) {
+        event->arg_kind = arg->kind;
+        event->arg_len = arg->len;
+        __builtin_memcpy(event->arg, arg->data, sizeof(event->arg));
+    }
+    __u8 *kind = bpf_map_lookup_elem(&capture_args, &started->nr);
+    if (kind && *kind == ARG_SOCKADDR1_OUT && ctx->ret >= 0)
+        capture_peer(event, started->args);
+    event->lport = started->lport;
 
     struct wakeup_value *wakeup = bpf_map_lookup_elem(&wakeups, &tid);
     if (wakeup && wakeup->ts_ns >= started->start_ns) {
@@ -281,6 +458,34 @@ int trace_sys_exit(struct sys_exit_ctx *ctx)
 cleanup:
     bpf_map_delete_elem(&wakeups, &tid);
     bpf_map_delete_elem(&inflight, &tid);
+    bpf_map_delete_elem(&inflight_args, &tid);
+    return 0;
+}
+
+/* A program of its own rather than a line in trace_sys_enter, which returns
+   for any number outside the two traced classes. The tracepoint fires after
+   the seccomp check, so a call a filter refused is never counted: the set is
+   what the unit was allowed to do and did. */
+SEC("tracepoint/raw_syscalls/sys_enter")
+int count_sys_enter(struct sys_enter_ctx *ctx)
+{
+    __u64 nr = (__u64)ctx->id;
+    if (nr >= MAX_SYSCALL_NR)
+        return 0;
+    __u64 cgroup = bpf_get_current_cgroup_id();
+    struct syscall_set *set = bpf_map_lookup_elem(&syscall_sets, &cgroup);
+    if (!set) {
+        __u32 zero = 0;
+        struct syscall_set *blank = bpf_map_lookup_elem(&syscall_set_blank, &zero);
+        if (!blank)
+            return 0;
+        /* NOEXIST: a call on another CPU may have just added it */
+        bpf_map_update_elem(&syscall_sets, &cgroup, blank, BPF_NOEXIST);
+        set = bpf_map_lookup_elem(&syscall_sets, &cgroup);
+        if (!set)
+            return 0;
+    }
+    __sync_fetch_and_add(&set->calls[nr], 1);
     return 0;
 }
 

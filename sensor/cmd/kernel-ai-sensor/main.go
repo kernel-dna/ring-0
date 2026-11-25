@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -34,6 +35,8 @@ type config struct {
 	securitySocketPath   string
 	peerSnapshotPath     string
 	peerSnapshotInterval time.Duration
+	setsSnapshotPath     string
+	setsSnapshotInterval time.Duration
 	minDuration          time.Duration
 	printEvents          bool
 }
@@ -195,6 +198,29 @@ func securityNames() map[uint32]string {
 	return names
 }
 
+// Argument kinds the kernel side copies, at syscall entry except for
+// argSockaddrOut1. Must match ARG_* in sensor.bpf.c.
+const (
+	argPath0        = 1
+	argPath1        = 2
+	argSockaddr1    = 3
+	argSockaddrOut1 = 4 // the peer accept writes back; arrives as argSockaddr1
+)
+
+// argCaptures says which argument is worth copying out of user memory: the
+// raw args are pointers, and a token stream of bare names cannot tell a shell
+// from a compiler, or a loopback health check from a connect to the outside.
+func argCaptures() map[uint32]uint8 {
+	return map[uint32]uint8{
+		unix.SYS_EXECVE:   argPath0,
+		unix.SYS_EXECVEAT: argPath1,
+		unix.SYS_CONNECT:  argSockaddr1,
+		unix.SYS_BIND:     argSockaddr1,
+		unix.SYS_ACCEPT:   argSockaddrOut1,
+		unix.SYS_ACCEPT4:  argSockaddrOut1,
+	}
+}
+
 // syscallNames is the union used to label events.
 func syscallNames() map[uint32]string {
 	names := latencyNames()
@@ -288,12 +314,104 @@ func normalize(raw sensorbpf.RawEvent, sequence uint64, offset int64, names map[
 	return normalized
 }
 
+// securityView adds what only the security socket carries: the parent pid and
+// the argument copied at entry. The latency socket feeds the public page, and
+// executable paths and connect destinations describe the host itself.
+func securityView(base event.KernelEventV1, raw sensorbpf.RawEvent) event.KernelEventV1 {
+	base.PPID = raw.PPID
+	base.Syscall.LocalPort = raw.LocalPort
+	data := raw.Arg[:min(int(raw.ArgLen), len(raw.Arg))]
+	switch raw.ArgKind {
+	case argPath0, argPath1:
+		base.Syscall.Path = cString(data)
+	case argSockaddr1:
+		base.Syscall.Sockaddr = decodeSockaddr(data)
+		if name := base.Syscall.Name; name == "accept" || name == "accept4" {
+			base.Syscall.Sockaddr = acceptedPeer(base.Syscall.Sockaddr)
+		}
+	}
+	return base
+}
+
+// acceptedPeer keeps an accepted peer's address only on loopback. Anywhere
+// else the peer is a visitor, and the security stream is recorded to disk, so
+// only the family and the port remain. On loopback the port pairs an accept
+// with the connect that made it; outside it names the visitor's connection,
+// whose port nginx hands to the app.
+func acceptedPeer(address *event.Sockaddr) *event.Sockaddr {
+	if address == nil || address.Addr == "" {
+		return address
+	}
+	if ip := net.ParseIP(address.Addr); ip != nil && ip.IsLoopback() {
+		return address
+	}
+	return &event.Sockaddr{Family: address.Family, Port: address.Port}
+}
+
+func cString(data []byte) string {
+	if end := bytes.IndexByte(data, 0); end >= 0 {
+		data = data[:end]
+	}
+	return string(data)
+}
+
+// decodeSockaddr reads the address as the caller passed it, or as accept
+// returned it. sa_family is in host order; the port and address are in
+// network order.
+func decodeSockaddr(data []byte) *event.Sockaddr {
+	if len(data) < 2 {
+		return nil
+	}
+	family := binary.NativeEndian.Uint16(data[:2])
+	switch family {
+	case unix.AF_INET:
+		address := &event.Sockaddr{Family: "inet"}
+		if len(data) >= 8 {
+			address.Port = binary.BigEndian.Uint16(data[2:4])
+			address.Addr = net.IP(data[4:8]).String()
+		}
+		return address
+	case unix.AF_INET6:
+		address := &event.Sockaddr{Family: "inet6"}
+		if len(data) >= 24 {
+			address.Port = binary.BigEndian.Uint16(data[2:4])
+			address.Addr = net.IP(data[8:24]).String()
+		}
+		return address
+	case unix.AF_UNIX:
+		path := data[2:]
+		// An abstract name starts with a NUL and runs to the address length.
+		if len(path) > 0 && path[0] == 0 {
+			return &event.Sockaddr{Family: "unix", Path: "@" + string(bytes.TrimRight(path[1:], "\x00"))}
+		}
+		return &event.Sockaddr{Family: "unix", Path: cString(path)}
+	case unix.AF_UNSPEC:
+		return &event.Sockaddr{Family: "unspec"}
+	case unix.AF_NETLINK:
+		return &event.Sockaddr{Family: "netlink"}
+	case unix.AF_PACKET:
+		return &event.Sockaddr{Family: "packet"}
+	default:
+		return &event.Sockaddr{Family: strconv.Itoa(int(family))}
+	}
+}
+
+func marshalLine(normalized event.KernelEventV1) []byte {
+	payload, err := json.Marshal(normalized)
+	if err != nil {
+		return nil
+	}
+	return append(payload, '\n')
+}
+
 func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.socketPath, "socket", "/run/kernel-ai/sensor.sock", "unixpacket output socket")
 	flag.StringVar(&cfg.securitySocketPath, "security-socket", "", "unixpacket socket for the security syscall class (empty = class not traced)")
 	flag.StringVar(&cfg.peerSnapshotPath, "peer-distance-snapshot", "", "file to publish per-peer TTL distance to (empty = not measured)")
 	flag.DurationVar(&cfg.peerSnapshotInterval, "peer-distance-interval", 5*time.Second, "how often to republish the peer distance snapshot")
+	flag.StringVar(&cfg.setsSnapshotPath, "syscall-sets-snapshot", "", "file to publish every cgroup's calls by syscall number to (empty = not counted)")
+	flag.DurationVar(&cfg.setsSnapshotInterval, "syscall-sets-interval", 5*time.Second, "how often to republish the syscall sets snapshot")
 	flag.DurationVar(&cfg.minDuration, "min-duration", 100*time.Millisecond, "minimum completed syscall duration (latency class only)")
 	flag.BoolVar(&cfg.printEvents, "print", false, "also write event JSON to stdout")
 	flag.Parse()
@@ -335,6 +453,13 @@ func run(ctx context.Context, cfg config) error {
 			return fmt.Errorf("watch syscall %d: %w", nr, err)
 		}
 	}
+	if len(security) > 0 {
+		for nr, kind := range argCaptures() {
+			if err := objects.CaptureArgs.Put(nr, kind); err != nil {
+				return fmt.Errorf("capture args of syscall %d: %w", nr, err)
+			}
+		}
+	}
 	self := uint32(os.Getpid())
 	if err := objects.IgnoredTgids.Put(self, uint8(1)); err != nil {
 		return fmt.Errorf("ignore sensor process: %w", err)
@@ -356,6 +481,13 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("attach sched_wakeup: %w", err)
 	}
 	links = append(links, wakeupLink)
+	if len(security) > 0 {
+		connectLink, err := link.Kprobe("tcp_connect", objects.TraceTcpConnect, nil)
+		if err != nil {
+			return fmt.Errorf("attach tcp_connect: %w", err)
+		}
+		links = append(links, connectLink)
+	}
 	if cfg.peerSnapshotPath != "" {
 		// The generic handler, not tcp_v4_conn_request: a Go listener reaches
 		// this one without passing through the IPv4 wrapper, so the wrapper
@@ -365,6 +497,13 @@ func run(ctx context.Context, cfg config) error {
 			return fmt.Errorf("attach tcp_conn_request: %w", err)
 		}
 		links = append(links, connLink)
+	}
+	if cfg.setsSnapshotPath != "" {
+		countLink, err := link.Tracepoint("raw_syscalls", "sys_enter", objects.CountSysEnter, nil)
+		if err != nil {
+			return fmt.Errorf("attach syscall counter: %w", err)
+		}
+		links = append(links, countLink)
 	}
 	defer func() {
 		for _, attached := range links {
@@ -406,6 +545,9 @@ func run(ctx context.Context, cfg config) error {
 	if cfg.peerSnapshotPath != "" {
 		go publishPeerDistance(ctx, objects.PeerDistance, cfg, offset)
 	}
+	if cfg.setsSnapshotPath != "" {
+		go publishSyscallSets(ctx, objects.SyscallSets, cfg, time.Now())
+	}
 
 	var sequence uint64
 	log.Printf("sensor ready socket=%s syscalls=%d min_duration=%s security_socket=%q security_syscalls=%d",
@@ -425,23 +567,26 @@ func run(ctx context.Context, cfg config) error {
 		}
 		sequence++
 		normalized := normalize(raw, sequence, offset, names)
-		payload, err := json.Marshal(normalized)
-		if err != nil {
-			continue
-		}
-		payload = append(payload, '\n')
+		var securityPayload []byte
 		if _, ok := security[raw.NR]; ok && securityStream != nil {
-			securityStream.publish(payload)
+			if securityPayload = marshalLine(securityView(normalized, raw)); securityPayload != nil {
+				securityStream.publish(securityPayload)
+			}
 		}
 		// The latency floor is no longer enforced in-kernel for syscalls the
 		// security class also watches, so re-apply it here. Without this the
 		// visualisation stream would suddenly carry every microsecond-long
 		// accept4, which is the load the Stage 6 rollback was avoiding.
 		if _, ok := latency[raw.NR]; ok && raw.DurationNS >= uint64(cfg.minDuration) {
-			stream.publish(payload)
+			if payload := marshalLine(normalized); payload != nil {
+				stream.publish(payload)
+			}
 		}
 		if cfg.printEvents {
-			_, _ = os.Stdout.Write(payload)
+			if securityPayload == nil {
+				securityPayload = marshalLine(securityView(normalized, raw))
+			}
+			_, _ = os.Stdout.Write(securityPayload)
 		}
 	}
 }

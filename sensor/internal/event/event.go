@@ -10,6 +10,21 @@ type SyscallSpan struct {
 	DurationUS uint64    `json:"duration_us"`
 	FD         *uint32   `json:"fd,omitempty"`
 	FDTarget   string    `json:"fd_target,omitempty"`
+	// Path, Sockaddr and LocalPort are only published on the security socket.
+	// Path and Sockaddr are copied from user memory at syscall entry, except
+	// the Sockaddr of accept and accept4: the peer, read as the call returns,
+	// with the address kept only on loopback.
+	// LocalPort is the port a TCP connect was given.
+	Path      string    `json:"path,omitempty"`
+	Sockaddr  *Sockaddr `json:"sockaddr,omitempty"`
+	LocalPort uint16    `json:"local_port,omitempty"`
+}
+
+type Sockaddr struct {
+	Family string `json:"family"`
+	Addr   string `json:"addr,omitempty"`
+	Port   uint16 `json:"port,omitempty"`
+	Path   string `json:"path,omitempty"`
 }
 
 type Wakeup struct {
@@ -30,6 +45,7 @@ type KernelEventV1 struct {
 	StartNS   uint64      `json:"start_monotonic_ns"`
 	EndNS     uint64      `json:"end_monotonic_ns"`
 	PID       uint32      `json:"pid"`
+	PPID      uint32      `json:"ppid,omitempty"`
 	TID       uint32      `json:"tid"`
 	UID       uint32      `json:"uid"`
 	CPU       uint32      `json:"cpu"`
