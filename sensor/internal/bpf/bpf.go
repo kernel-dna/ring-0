@@ -15,6 +15,10 @@ func LoadObjects(objects *Objects, options *ebpf.CollectionOptions) error {
 // buffer cannot.
 type PeerDistance = sensorPeerDistance
 
+// SyscallSet is the value side of the syscall_sets map: calls by syscall
+// number for one cgroup.
+type SyscallSet = sensorSyscallSet
+
 // RawEvent must remain byte-for-byte aligned with struct sensor_event in
 // sensor.bpf.c. Generated map bindings cannot infer a ring-buffer element type.
 type RawEvent struct {
@@ -34,7 +38,13 @@ type RawEvent struct {
 	WakerTID   uint32
 	TargetCPU  uint32
 	HasWakeup  uint8
-	Pad        [7]uint8
+	Pad0       uint8
+	LocalPort  uint16
+	Pad1       [4]uint8
 	Comm       [16]byte
 	WakerComm  [16]byte
+	PPID       uint32
+	ArgKind    uint16
+	ArgLen     uint16
+	Arg        [128]byte
 }

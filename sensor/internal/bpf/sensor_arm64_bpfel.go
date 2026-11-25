@@ -13,6 +13,15 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type sensorArgValue struct {
+	_       structs.HostLayout
+	StartNs uint64
+	Kind    uint16
+	Len     uint16
+	Pad     [4]uint8
+	Data    [128]uint8
+}
+
 type sensorInflightValue struct {
 	_       structs.HostLayout
 	StartNs uint64
@@ -20,7 +29,8 @@ type sensorInflightValue struct {
 	Pid     uint32
 	Uid     uint32
 	Nr      uint32
-	_       [4]byte
+	Lport   uint16
+	_       [2]byte
 }
 
 type sensorPeerDistance struct {
@@ -30,6 +40,11 @@ type sensorPeerDistance struct {
 	MinTtl      uint8
 	LastTtl     uint8
 	Pad         [6]uint8
+}
+
+type sensorSyscallSet struct {
+	_     structs.HostLayout
+	Calls [512]uint64
 }
 
 type sensorWakeupValue struct {
@@ -46,17 +61,23 @@ type sensorWakeupValue struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	sensorMapCaptureArgs       = "capture_args"
 	sensorMapDrops             = "drops"
 	sensorMapEvents            = "events"
 	sensorMapIgnoredTgids      = "ignored_tgids"
 	sensorMapInflight          = "inflight"
+	sensorMapInflightArgs      = "inflight_args"
 	sensorMapPeerDistance      = "peer_distance"
+	sensorMapSyscallSetBlank   = "syscall_set_blank"
+	sensorMapSyscallSets       = "syscall_sets"
 	sensorMapWakeups           = "wakeups"
 	sensorMapWatchedSyscalls   = "watched_syscalls"
+	sensorProgCountSysEnter    = "count_sys_enter"
 	sensorProgTraceConnRequest = "trace_conn_request"
 	sensorProgTraceSchedWakeup = "trace_sched_wakeup"
 	sensorProgTraceSysEnter    = "trace_sys_enter"
 	sensorProgTraceSysExit     = "trace_sys_exit"
+	sensorProgTraceTcpConnect  = "trace_tcp_connect"
 )
 
 // loadSensor returns the embedded CollectionSpec for sensor.
@@ -101,21 +122,27 @@ type sensorSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type sensorProgramSpecs struct {
+	CountSysEnter    *ebpf.ProgramSpec `ebpf:"count_sys_enter"`
 	TraceConnRequest *ebpf.ProgramSpec `ebpf:"trace_conn_request"`
 	TraceSchedWakeup *ebpf.ProgramSpec `ebpf:"trace_sched_wakeup"`
 	TraceSysEnter    *ebpf.ProgramSpec `ebpf:"trace_sys_enter"`
 	TraceSysExit     *ebpf.ProgramSpec `ebpf:"trace_sys_exit"`
+	TraceTcpConnect  *ebpf.ProgramSpec `ebpf:"trace_tcp_connect"`
 }
 
 // sensorMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type sensorMapSpecs struct {
+	CaptureArgs     *ebpf.MapSpec `ebpf:"capture_args"`
 	Drops           *ebpf.MapSpec `ebpf:"drops"`
 	Events          *ebpf.MapSpec `ebpf:"events"`
 	IgnoredTgids    *ebpf.MapSpec `ebpf:"ignored_tgids"`
 	Inflight        *ebpf.MapSpec `ebpf:"inflight"`
+	InflightArgs    *ebpf.MapSpec `ebpf:"inflight_args"`
 	PeerDistance    *ebpf.MapSpec `ebpf:"peer_distance"`
+	SyscallSetBlank *ebpf.MapSpec `ebpf:"syscall_set_blank"`
+	SyscallSets     *ebpf.MapSpec `ebpf:"syscall_sets"`
 	Wakeups         *ebpf.MapSpec `ebpf:"wakeups"`
 	WatchedSyscalls *ebpf.MapSpec `ebpf:"watched_syscalls"`
 }
@@ -146,22 +173,30 @@ func (o *sensorObjects) Close() error {
 //
 // It can be passed to loadSensorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type sensorMaps struct {
+	CaptureArgs     *ebpf.Map `ebpf:"capture_args"`
 	Drops           *ebpf.Map `ebpf:"drops"`
 	Events          *ebpf.Map `ebpf:"events"`
 	IgnoredTgids    *ebpf.Map `ebpf:"ignored_tgids"`
 	Inflight        *ebpf.Map `ebpf:"inflight"`
+	InflightArgs    *ebpf.Map `ebpf:"inflight_args"`
 	PeerDistance    *ebpf.Map `ebpf:"peer_distance"`
+	SyscallSetBlank *ebpf.Map `ebpf:"syscall_set_blank"`
+	SyscallSets     *ebpf.Map `ebpf:"syscall_sets"`
 	Wakeups         *ebpf.Map `ebpf:"wakeups"`
 	WatchedSyscalls *ebpf.Map `ebpf:"watched_syscalls"`
 }
 
 func (m *sensorMaps) Close() error {
 	return _SensorClose(
+		m.CaptureArgs,
 		m.Drops,
 		m.Events,
 		m.IgnoredTgids,
 		m.Inflight,
+		m.InflightArgs,
 		m.PeerDistance,
+		m.SyscallSetBlank,
+		m.SyscallSets,
 		m.Wakeups,
 		m.WatchedSyscalls,
 	)
@@ -177,18 +212,22 @@ type sensorVariables struct {
 //
 // It can be passed to loadSensorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type sensorPrograms struct {
+	CountSysEnter    *ebpf.Program `ebpf:"count_sys_enter"`
 	TraceConnRequest *ebpf.Program `ebpf:"trace_conn_request"`
 	TraceSchedWakeup *ebpf.Program `ebpf:"trace_sched_wakeup"`
 	TraceSysEnter    *ebpf.Program `ebpf:"trace_sys_enter"`
 	TraceSysExit     *ebpf.Program `ebpf:"trace_sys_exit"`
+	TraceTcpConnect  *ebpf.Program `ebpf:"trace_tcp_connect"`
 }
 
 func (p *sensorPrograms) Close() error {
 	return _SensorClose(
+		p.CountSysEnter,
 		p.TraceConnRequest,
 		p.TraceSchedWakeup,
 		p.TraceSysEnter,
 		p.TraceSysExit,
+		p.TraceTcpConnect,
 	)
 }
 

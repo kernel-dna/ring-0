@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import pwd
 import re
 import time
 
 import psutil
 
+from kernel_ai.ml.proc_baseline import _privesc_allowlist
 from kernel_ai.services import system_view as _system_view_service
 from kernel_ai.sentry_helpers import capture_exception
 
@@ -473,12 +476,178 @@ def _describe_ancestor(proc):
     }
 
 
-def get_process_lineage_info(pid):
+_HEREDITY_FIELDS = frozenset(("Name", "Uid", "CapEff", "CapBnd", "NoNewPrivs", "Seccomp", "Seccomp_filters", "NSpid"))
+_HEREDITY_NAMESPACES = ("mnt", "pid", "net", "user")
+
+
+def _read_digest(path, limit=1 << 18):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.blake2b(f.read(limit), digest_size=8).hexdigest()
+    except OSError:
+        return None
+
+
+def _read_interfaces(pid):
+    try:
+        with open(f"/proc/{pid}/net/dev", "r", encoding="utf-8", errors="replace") as f:
+            rows = f.read().splitlines()[2:]
+    except OSError:
+        return None
+    return tuple(sorted(row.split(":", 1)[0].strip() for row in rows if ":" in row))
+
+
+def _read_unit(pid):
+    """The systemd service or scope whose cgroup holds the process."""
+    try:
+        with open(f"/proc/{pid}/cgroup", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("0::"):
+                    parts = [part for part in line[3:].strip().split("/") if part]
+                    named = [part for part in parts if part.endswith((".service", ".scope"))]
+                    return (named or parts or [None])[-1]
+    except OSError:
+        pass
+    return None
+
+
+def _user_name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def _read_heredity(pid):
+    """What a process carries from its parent: credentials, seccomp filters, no_new_privs and namespaces.
+
+    The status fields are world readable and the namespace links are not, so each namespace is told
+    apart by what it shows instead: the mount table, the pid nesting, the interfaces and the uid map.
+    """
+    fields = {}
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                key, sep, value = line.partition(":")
+                if sep and key in _HEREDITY_FIELDS:
+                    fields[key] = value.split()
+        ruid, euid = int(fields["Uid"][0]), int(fields["Uid"][1])
+    except (OSError, KeyError, IndexError, ValueError):
+        return None
+
+    def number(key, base=10):
+        try:
+            return int(fields[key][0], base)
+        except (KeyError, IndexError, ValueError):
+            return None
+
+    caps, bound = number("CapEff", 16), number("CapBnd", 16)
+    return {
+        "comm": " ".join(fields.get("Name", [])),
+        "ruid": ruid,
+        "euid": euid,
+        "caps": None if caps is None else bin(caps).count("1"),
+        "bound": None if bound is None else bin(bound).count("1"),
+        "nnp": number("NoNewPrivs") == 1,
+        "seccomp": number("Seccomp") or 0,
+        "filters": number("Seccomp_filters") or 0,
+        "ns": {
+            "mnt": _read_digest(f"/proc/{pid}/mountinfo"),
+            "pid": len(fields.get("NSpid", [])) or None,
+            "net": _read_interfaces(pid),
+            "user": _read_digest(f"/proc/{pid}/uid_map"),
+        },
+        "unit": _read_unit(pid),
+    }
+
+
+def _other_namespaces(traits, base):
+    if not traits or not base:
+        return []
+    return [kind for kind in _HEREDITY_NAMESPACES
+            if traits["ns"][kind] is not None and base["ns"][kind] is not None
+            and traits["ns"][kind] != base["ns"][kind]]
+
+
+def _heredity_changes(parent, child, base=None):
+    """How a generation differs from its parent, and whether the parent could have passed it on.
+
+    A gain raises a privilege, a drop gives one up, a switch trades one unprivileged user for another
+    and new is a namespace of its own. Capabilities count in the holder's user namespace, so outside
+    the base generation's they are marked userns. no_new_privs is never cleared, seccomp filters are
+    never removed and the bounding set only shrinks outside a new user namespace: a child that lost
+    one of them was adopted by this parent when its own died, and its traits came from elsewhere.
+    """
+    if not parent or not child:
+        return [], False
+    own_users = "user" in _other_namespaces(child, parent)
+    if ((parent["nnp"] and not child["nnp"]) or child["filters"] < parent["filters"]
+            or (not own_users and None not in (parent["bound"], child["bound"]) and child["bound"] > parent["bound"])):
+        return [], True
+    changes = []
+    if parent["euid"] != child["euid"]:
+        kind = "gain" if child["euid"] == 0 else "drop" if parent["euid"] == 0 else "switch"
+        changes.append({"trait": "user", "from": _user_name(parent["euid"]), "to": _user_name(child["euid"]), "kind": kind})
+    userns = "user" in _other_namespaces(child, base or parent)
+    for trait in ("caps", "bound"):
+        before, after = parent[trait], child[trait]
+        if None not in (before, after) and before != after:
+            change = {"trait": trait, "from": before, "to": after, "kind": "gain" if after > before else "drop"}
+            if userns:
+                change["userns"] = True
+            changes.append(change)
+    if child["nnp"] and not parent["nnp"]:
+        changes.append({"trait": "nnp", "from": False, "to": True, "kind": "drop"})
+    if child["filters"] > parent["filters"] or child["seccomp"] > parent["seccomp"]:
+        changes.append({"trait": "seccomp", "from": parent["filters"], "to": child["filters"], "kind": "drop"})
+    fresh = _other_namespaces(child, parent)
+    if fresh:
+        changes.append({"trait": "ns", "from": [], "to": fresh, "kind": "new"})
+    return changes, False
+
+
+def _cap_full():
+    try:
+        with open("/proc/sys/kernel/cap_last_cap", "r", encoding="ascii") as f:
+            return int(f.read().strip()) + 1
+    except (OSError, ValueError):
+        return None
+
+
+def _add_heredity(chain):
+    """Each generation's inherited traits next to its parent's, with what changed between them.
+
+    privesc is Stage 5's rule: effective root under another real user, outside the setuid helpers.
+    """
+    helpers = _privesc_allowlist()
+    read = [_read_heredity(row["pid"]) for row in chain]
+    for index, (row, traits) in enumerate(zip(chain, read)):
+        if traits is None:
+            row["traits"], row["changes"], row["adopted"], row["privesc"] = None, [], False, None
+            continue
+        row["changes"], row["adopted"] = _heredity_changes(read[index - 1] if index else None, traits, read[0])
+        row["traits"] = {
+            "user": _user_name(traits["euid"]),
+            "real_user": _user_name(traits["ruid"]) if traits["ruid"] != traits["euid"] else None,
+            "caps": traits["caps"],
+            "bound": traits["bound"],
+            "nnp": traits["nnp"],
+            "seccomp": traits["seccomp"],
+            "filters": traits["filters"],
+            "ns": _other_namespaces(traits, read[0]),
+            "unit": traits["unit"],
+        }
+        row["privesc"] = (("helper" if traits["comm"] in helpers else "flagged")
+                          if traits["euid"] == 0 and traits["ruid"] != 0 else None)
+
+
+def get_process_lineage_info(pid, traits=False):
     """Ancestry chain from init down to ``pid``, ordered oldest first.
 
     Unlike fd tables, ``/proc/<pid>/stat`` is world readable, so start times and
     parent links resolve for foreign processes too. Timestamps here are real
-    kernel start times, not a synthetic window.
+    kernel start times, not a synthetic window. With ``traits`` each generation
+    also carries what it inherited: credentials, seccomp, no_new_privs, namespaces.
     """
     try:
         proc = psutil.Process(pid)
@@ -499,6 +668,8 @@ def get_process_lineage_info(pid):
             except (psutil.AccessDenied, psutil.NoSuchProcess):
                 break
         chain.reverse()
+        if traits:
+            _add_heredity(chain)
 
         try:
             children = proc.children()
@@ -512,7 +683,7 @@ def get_process_lineage_info(pid):
             child_count = 0
 
         self_row = chain[-1] if chain else None
-        return {
+        out = {
             "pid": pid,
             "chain": chain,
             "depth": len(chain),
@@ -522,6 +693,9 @@ def get_process_lineage_info(pid):
             "boot_time": psutil.boot_time(),
             "age_s": self_row.get("age_s") if self_row else None,
         }
+        if traits:
+            out["caps_full"] = _cap_full()
+        return out
     except psutil.AccessDenied as e:
         return {"error": str(e), "pid": pid}
     except Exception as e:

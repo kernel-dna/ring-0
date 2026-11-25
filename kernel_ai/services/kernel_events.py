@@ -10,8 +10,9 @@ import time
 SNAPSHOT = os.environ.get("KERNEL_EVENTS_SNAPSHOT", "/run/kernel-ai/kernel-events.json")
 # Names-only view of the sensor's security stream. Whatever the file holds, only
 # the syscall name, its systemd unit, its order, the broker's lane number for its
-# process and, for a call the broker marked as a mutation, the names of the n-gram
-# it completed leave this module.
+# process, for a call the broker marked as a mutation the names of the n-gram it
+# completed, and whether the call carried one of the requester's own requests
+# leave this module. The loopback port that decides the last one does not.
 SECURITY_SNAPSHOT = os.environ.get(
     "KERNEL_SECURITY_NAMES_SNAPSHOT", "/run/kernel-ai/security-names.json"
 )
@@ -65,11 +66,26 @@ def _snapshot(path, stream):
     return payload, None
 
 
-def _name_only(event):
+def _mine(event, mine, conns):
+    """A hop of one of the requester's requests, or nginx's accept of one of its connections."""
+    hop = event.get("hop")
+    if type(hop) is int and hop in mine:
+        return "request"
+    # nginx's accept of a browser on the same host comes from loopback, so its peer is a hop
+    peer = event.get("client", hop)
+    if event.get("syscall") in ("accept", "accept4") and type(peer) is int and peer in conns:
+        return "connection"
+    return None
+
+
+def _name_only(event, mine=frozenset(), conns=frozenset()):
     name = event.get("syscall")
     if not isinstance(name, str) or not _SYSCALL_NAME.fullmatch(name):
         return None
     out = {"seq": int(event.get("seq", 0)), "syscall": name}
+    kind = _mine(event, mine, conns)
+    if kind:
+        out["mine"] = kind
     unit = event.get("unit")
     if isinstance(unit, str) and _UNIT_NAME.fullmatch(unit):
         out["unit"] = unit
@@ -155,12 +171,21 @@ def get_alert_fragment(alert):
     }
 
 
-def get_kernel_events(*, pids=None, since_seq=0, limit=80, stream="latency"):
+def get_kernel_events(*, pids=None, since_seq=0, limit=80, stream="latency", mine=None, conns=None):
+    """mine: the ports the requester's earlier requests reached the app from; the
+    security stream marks the calls of the loopback hops that carried them.
+    conns: the ports the requester's connections reached nginx from; the security
+    stream marks nginx's accept of each, and conn_seqs names those accepts wherever
+    they stand in the snapshot."""
     if stream not in STREAMS:
         raise ValueError(f"stream must be one of: {', '.join(STREAMS)}")
     security = stream == "security"
     if security and pids:
         raise ValueError("the security stream carries no pids to filter by")
+    if (mine or conns) and not security:
+        raise ValueError("only the security stream marks the requester's own calls")
+    ports = frozenset(mine or ())
+    conn_ports = frozenset(conns or ())
     path = SECURITY_SNAPSHOT if security else SNAPSHOT
     payload, error = _snapshot(path, stream)
     if error:
@@ -190,10 +215,20 @@ def get_kernel_events(*, pids=None, since_seq=0, limit=80, stream="latency"):
         if wanted and pid not in wanted:
             continue
         if security:
-            event = _name_only(event)
+            event = _name_only(event, ports, conn_ports)
             if event is None:
                 continue
         events.append(event)
+    # Over HTTP/1.1 a page polls on several connections, and nginx accepted each one before
+    # the page knew its port, so an earlier reply may already have carried that accept
+    own = sorted(
+        event["seq"]
+        for event in all_events
+        if security and type(event.get("seq")) is int and _mine(event, ports, conn_ports) == "connection"
+    )
+    if own and not since:
+        # a first poll reaches back to the accept of its connection, made as the page loaded
+        bounded_limit = max(bounded_limit, sum(1 for event in events if event["seq"] >= own[0]))
     events = events[-bounded_limit:]
     age = max(0.0, time.time() - os.path.getmtime(path))
     source = {
@@ -205,7 +240,8 @@ def get_kernel_events(*, pids=None, since_seq=0, limit=80, stream="latency"):
     }
     if security:
         declared = {f.strip() for f in str((payload.get("sources") or {}).get("fields") or "").split(",")}
-        source["fields"] = ", ".join(["names", "units"] + [f for f in _OPTIONAL_FIELDS if f in declared])
+        fields = ["names", "units"] + [f for f in _OPTIONAL_FIELDS if f in declared]
+        source["fields"] = ", ".join(fields + (["mine"] if "hops" in declared else []))
     else:
         source.update(
             {
@@ -215,10 +251,13 @@ def get_kernel_events(*, pids=None, since_seq=0, limit=80, stream="latency"):
                 "wakeup": (payload.get("sources") or {}).get("wakeup"),
             }
         )
-    return {
+    result = {
         "available": True,
         "seq": int(payload.get("seq", 0)),
         "events": events,
         "cursor_lost": cursor_lost,
         "source": source,
     }
+    if own:
+        result["conn_seqs"] = own[-16:]
+    return result

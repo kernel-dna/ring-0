@@ -45,6 +45,7 @@ _API_ROUTES = [
     ("/proc-timeline-branches", "get_proc_timeline_branches", h.get_proc_timeline_branches, None),
     ("/execution-context", "get_execution_context", h.get_execution_context, None),
     ("/kernel-dna", "kernel_dna", h.kernel_dna, None),
+    ("/syscall-genome", "syscall_genome", h.syscall_genome, None),
     ("/siem-alerts", "siem_alerts", h.siem_alerts, None),
     ("/ml-anomalies", "ml_anomalies", h.ml_anomalies, None),
     ("/ml-drift", "ml_drift", h.ml_drift, None),
