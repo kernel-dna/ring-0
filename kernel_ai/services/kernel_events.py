@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import calendar
+import gzip
 import json
 import os
 import re
 import time
+from collections import OrderedDict
 
 SNAPSHOT = os.environ.get("KERNEL_EVENTS_SNAPSHOT", "/run/kernel-ai/kernel-events.json")
 # Names-only view of the sensor's security stream. Whatever the file holds, only
@@ -20,6 +23,15 @@ SECURITY_SNAPSHOT = os.environ.get(
 IMMUNE_SNAPSHOT = os.environ.get(
     "KERNEL_SECURITY_IMMUNE_SNAPSHOT", "/run/kernel-ai/security-immune.json"
 )
+# The same view by UTC minute, written by that broker for playback (see Tape there).
+TAPE_DIR = os.environ.get("KERNEL_SECURITY_TAPE_DIR", "/var/lib/kernel-ai-tape")
+TAPE_SPAN_MAX_S = 60
+TAPE_EVENTS_MAX = 3000
+# A minute holds at most MAX_EPS=300 calls a second; numbering by minute keeps the order
+# across broker restarts, which start the broker's own count again.
+_TAPE_PER_MINUTE = 20000
+_TAPE_CACHE = 16
+_tape = {"minutes": OrderedDict()}
 STREAMS = ("latency", "security")
 MAX_AGE_S = float(os.environ.get("KERNEL_EVENTS_MAX_AGE_S", "5"))
 MAX_LIMIT = 200
@@ -171,6 +183,123 @@ def get_alert_fragment(alert):
     }
 
 
+def _tape_path(minute):
+    stamp = time.gmtime(minute * 60)
+    return os.path.join(TAPE_DIR, time.strftime("%Y-%m-%d", stamp), time.strftime("%H%M", stamp) + ".jsonl.gz")
+
+
+def _tape_minute(minute):
+    """One recorded minute in the stream's public shape, with its time; [] if not recorded."""
+    cache = _tape["minutes"]
+    if minute in cache:
+        cache.move_to_end(minute)
+        return cache[minute]
+    events = []
+    try:
+        with gzip.open(_tape_path(minute), "rt", encoding="utf-8") as handle:
+            for i, line in enumerate(handle):
+                if i >= _TAPE_PER_MINUTE:
+                    break
+                try:
+                    raw = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(raw, dict) or type(raw.get("t")) not in (int, float):
+                    continue
+                event = _name_only({**raw, "seq": minute * _TAPE_PER_MINUTE + i})
+                if event is not None:
+                    event["t"] = round(float(raw["t"]), 3)
+                    events.append(event)
+    except (OSError, EOFError):
+        return []
+    cache[minute] = events
+    while len(cache) > _TAPE_CACHE:
+        cache.popitem(last=False)
+    return events
+
+
+def tape_span(now=None):
+    """The first and the last recorded minute, as epoch seconds; None when there is no tape."""
+    now = time.time() if now is None else now
+    cached = _tape.get("span")
+    if cached is not None and 0 <= now - cached[0] < 30:
+        return cached[1]
+    span = _read_tape_span(now)
+    _tape["span"] = (now, span)
+    return span
+
+
+def _read_tape_span(now):
+    try:
+        days = sorted(d for d in os.listdir(TAPE_DIR) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d))
+    except OSError:
+        return None
+    minutes = []
+    for day in (days[0], days[-1]) if days else ():
+        try:
+            names = sorted(n for n in os.listdir(os.path.join(TAPE_DIR, day)) if re.fullmatch(r"\d{4}\.jsonl\.gz", n))
+        except OSError:
+            continue
+        for name in (names[0], names[-1]) if names else ():
+            try:
+                stamp = time.strptime(f"{day} {name[:4]}", "%Y-%m-%d %H%M")
+            except ValueError:
+                continue
+            minutes.append(calendar.timegm(stamp) // 60)
+    if not minutes:
+        return None
+    return {"from": min(minutes) * 60, "to": min(max(minutes) * 60 + 60, int(now))}
+
+
+def _thin(events, limit):
+    """At most ``limit`` events spread evenly over the window, every mutation among them."""
+    novel = [i for i, e in enumerate(events) if e.get("novel")]
+    room = max(0, limit - len(novel))
+    rest = [i for i, e in enumerate(events) if not e.get("novel")]
+    step = len(rest) / room if room else 0
+    picked = set(novel[-limit:]) | ({rest[int(k * step)] for k in range(room)} if room else set())
+    return [events[i] for i in sorted(picked)]
+
+
+def get_tape(start, seconds=10, limit=TAPE_EVENTS_MAX):
+    """The security stream's public view as it was from ``start`` for ``seconds``: what
+    the live stream gave then, mutations as judged then. No requester's own calls: a
+    hop or a client port belonged to whoever asked at the time. More than ``limit``
+    calls are thinned evenly, mutations kept."""
+    try:
+        start = float(start)
+        seconds = float(seconds)
+        limit = int(limit)
+    except (TypeError, ValueError) as error:
+        raise ValueError("at, seconds and limit must be numbers") from error
+    if not 0 < seconds <= TAPE_SPAN_MAX_S:
+        raise ValueError(f"seconds must be within 0-{TAPE_SPAN_MAX_S}")
+    if not 1 <= limit <= TAPE_EVENTS_MAX:
+        raise ValueError(f"limit must be within 1-{TAPE_EVENTS_MAX}")
+    span = tape_span()
+    source = {"kind": "ebpf", "scope": "machine", "stream": "security", "fields": "names, units, lanes, mutations",
+              "recorded": "tape"}
+    if span is None:
+        return {"available": False, "events": [], "source": {**source, "reason": "no-tape"}}
+    end = start + seconds
+    events = []
+    for minute in range(int(start // 60), int(end // 60) + 1):
+        for event in _tape_minute(minute):
+            if start <= event["t"] < end:
+                events.append(event)
+    sampled = len(events) > limit
+    return {
+        "available": True,
+        "at": start,
+        "seconds": seconds,
+        "span": span,
+        "calls": len(events),
+        "events": _thin(events, limit) if sampled else events,
+        "sampled": sampled,
+        "source": source,
+    }
+
+
 def get_kernel_events(*, pids=None, since_seq=0, limit=80, stream="latency", mine=None, conns=None):
     """mine: the ports the requester's earlier requests reached the app from; the
     security stream marks the calls of the loopback hops that carried them.
@@ -260,4 +389,8 @@ def get_kernel_events(*, pids=None, since_seq=0, limit=80, stream="latency", min
     }
     if own:
         result["conn_seqs"] = own[-16:]
+    if security:
+        span = tape_span()
+        if span is not None:
+            result["tape"] = span
     return result

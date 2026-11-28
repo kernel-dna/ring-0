@@ -221,6 +221,7 @@ class MLWorker:
         self._last_stage8_emit = 0.0
         self._last_stage8_log = 0.0
         self._stage8_scored_at = -1
+        self._stage8_refused: str | None = None
         self._stage8_pid_marks: dict[int, int] = {}
         if self.cfg.enable_stage8:
             from kernel_ai.ml.sequence_deep import DeepSequenceScorer
@@ -251,6 +252,13 @@ class MLWorker:
                 len(self._http_tails),
                 bool(self.http_model),
             )
+
+        self.genes = None
+        if self.cfg.enable_genes:
+            from kernel_ai.ml.genes import GeneWatch
+
+            self.genes = GeneWatch(self.cfg.genes_state_path)
+            logger.info("syscall genes enabled: state=%s", self.cfg.genes_state_path)
 
     def _maybe_load_model(self) -> None:
         """Load / hot-reload the IsolationForest artifact if present and changed.
@@ -485,6 +493,14 @@ class MLWorker:
             return None
         self.deep_scorer.maybe_reload()
         if not self.deep_scorer.ready:
+            return None
+        # The tracker reads names; an artifact over argument tokens (replay --tokens) would
+        # see every live call as unseen
+        tokens_kind = (self.deep_scorer.markov.meta or {}).get("tokens", "name")
+        if tokens_kind != "name":
+            if self._stage8_refused != tokens_kind:
+                self._stage8_refused = tokens_kind
+                logger.warning("Stage 8 idle: artifact is over %r tokens, the live tracker gives names", tokens_kind)
             return None
         # Same frozen-window trap as Stage 4, and Stage 8 keeps its own mark because
         # both stages read the tracker in the same tick.
@@ -833,6 +849,11 @@ class MLWorker:
         ticks = 0
         while self._running:
             start = time.time()
+            if self.genes is not None:
+                try:
+                    self.genes.tick(start)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("syscall genes failed: %s", exc)
             try:
                 n = self._tick()
                 ticks += 1

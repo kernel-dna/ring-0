@@ -5,6 +5,7 @@ Modes:
   live     — spawn short-lived safe processes for a running STAGE5 worker
   mimicry  — Stage 8 vs STIDE: known-token odd order (STIDE misses, Markov hits)
   stream   — Stage 6 e2e: demo collector → unix socket → n-grams → STIDE/Markov
+  record   — sequence payloads inside a real unit, kept from the sensor's security socket (root)
 
 Examples:
   python -m kernel_ai.ml.polygon dry-run
@@ -417,6 +418,77 @@ def run_sequence(scenarios: list[str], *, timeout: float = 30.0) -> list[dict]:
     return out
 
 
+def record_sequence(
+    scenario: str, unit_cgroup: str, out_dir: str, *,
+    security_socket: str = "/run/kernel-ai/sensor-security.sock",
+    cgroup_root: str = "/sys/fs/cgroup", timeout: float = 30.0,
+) -> dict:
+    """Run one sequence payload inside a real unit and keep what the sensor saw of it.
+
+    A shell is started, moved into ``unit_cgroup`` (e.g. ``system.slice/nginx.service``)
+    and only then execs the payload, so the exec and every child are the unit's, as an
+    exploited service would show them. The trace is the security socket's raw lines for
+    that process tree, with a ``.cgroups.json`` sidecar for the unit context. Needs root
+    (moving a process between cgroups); dev box only.
+    """
+    import socket as _socket
+
+    payload = _SEQUENCE_PAYLOADS[scenario]
+    cg_dir = os.path.join(cgroup_root, unit_cgroup.strip("/"))
+    cg_id = os.stat(cg_dir).st_ino
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_SEQPACKET)
+    sock.settimeout(0.2)
+    sock.connect(security_socket)
+    shell = subprocess.Popen(
+        ["/bin/sh", "-c", 'read _ && exec /usr/bin/python3 -c "$0"', payload],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    with open(os.path.join(cg_dir, "cgroup.procs"), "w") as fh:
+        fh.write(str(shell.pid))
+    tree, lines, buf = {shell.pid}, [], b""
+    shell.stdin.write(b"go\n")
+    shell.stdin.close()
+    deadline = time.time() + timeout
+    exited_at = None
+    while time.time() < deadline and (exited_at is None or time.time() - exited_at < 1.0):
+        if exited_at is None and shell.poll() is not None:
+            exited_at = time.time()
+        try:
+            chunk = sock.recv(65536)
+        except _socket.timeout:
+            continue
+        buf += chunk
+        *ready, buf = buf.split(b"\n")
+        for line in ready:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            pid, ppid = int(obj.get("pid") or 0), int(obj.get("ppid") or 0)
+            if pid in tree or ppid in tree:
+                tree.add(pid)
+                # the shell's own exec happened before the move
+                if obj.get("cgroup_id") == cg_id:
+                    lines.append(line)
+    sock.close()
+    if shell.poll() is None:
+        shell.kill()
+    err = (shell.stderr.read() or b"").decode()[:160]
+    unit = unit_cgroup.strip("/").rsplit("/", 1)[-1]
+    base = os.path.join(out_dir, f"{scenario}@{unit}")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(base + ".jsonl", "wb") as fh:
+        fh.writelines(line + b"\n" for line in lines)
+    with open(base + ".cgroups.json", "w", encoding="utf-8") as fh:
+        json.dump({str(cg_id): unit_cgroup.strip("/")}, fh)
+    calls: dict[str, int] = {}
+    for line in lines:
+        name = (json.loads(line).get("syscall") or {}).get("name") or "?"
+        calls[name] = calls.get(name, 0) + 1
+    return {"scenario": scenario, "unit": unit, "events": len(lines), "pids": len(tree),
+            "rc": shell.returncode, "calls": calls, "path": base + ".jsonl", **({"stderr": err} if err else {})}
+
+
 def run_live(scenarios: list[str], *, duration: float = 6.0) -> None:
     """Spawn safe processes for a running ML worker (STAGE5=true) to observe."""
     procs: list[subprocess.Popen] = []
@@ -559,10 +631,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "mode",
         choices=(
-            "dry-run", "live", "sequence", "list", "mimicry", "stream",
+            "dry-run", "live", "sequence", "record", "list", "mimicry", "stream",
             "http-wordlist", "http-rce",
         ),
     )
+    parser.add_argument("--unit", action="append",
+                        help="record: cgroup of a real unit, e.g. system.slice/nginx.service (repeatable)")
+    parser.add_argument("--out", help="record: directory for the traces")
     parser.add_argument(
         "--scenario",
         action="append",
@@ -622,7 +697,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.scenario:
         scenarios = list(dict.fromkeys(args.scenario))
-    elif args.mode == "sequence":
+    elif args.mode in ("sequence", "record"):
         scenarios = [n for n, m in SCENARIOS.items() if m.get("sequence")]
     elif args.all or args.mode == "dry-run":
         # Sequence scenarios have no synthetic ProcSample: they are defined by
@@ -634,6 +709,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "sequence":
         run_sequence(scenarios)
         print("\ndone — Stage 4/8 score these on the next worker tick")
+        return 0
+
+    if args.mode == "record":
+        if not args.unit or not args.out:
+            parser.error("record needs --unit and --out")
+        for unit in args.unit:
+            for name in scenarios:
+                print(json.dumps(record_sequence(name, unit, args.out)))
         return 0
 
     if args.mode == "dry-run":
