@@ -6,8 +6,10 @@ line into a filter; folds cgroups into the unit names the security stream uses, 
 SEQUENCER track and its karyotype share one; and reads whether the unit runs under a filter.
 
 What leaves here: syscall names and counts per unit, how long ago each count last grew, a
-filter's kind and size, and the kernel's ``Seccomp:`` mode of the unit's main process. Never
-a pid, a cgroup path, an instance name, or the calls a unit's real filter lists.
+filter's kind and size, the kernel's ``Seccomp:`` mode of the unit's main process, and the
+calls a unit made for the first time (``kernel_ai/ml/genes.py``), loud or quiet by the groups
+systemd puts them in. Never a pid, a cgroup path,
+an instance name, or the calls a unit's real filter lists.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import os
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
 
 SETS_SNAPSHOT = os.environ.get("KERNEL_SYSCALL_SETS", "/run/kernel-ai/syscall-sets.json")
 # The sensor republishes every five seconds.
@@ -25,18 +28,32 @@ MAX_AGE_S = 30.0
 # A count that grew within the immune history's quarter hour is a call in use now.
 RECENT_S = 900
 FILTER_TTL_S = 30.0
+GENES_SNAPSHOT = os.environ.get("KERNEL_SYSCALL_GENES", "/run/kernel-ai/syscall-genes.json")
+# The gene watch republishes every ten seconds.
+GENES_MAX_AGE_S = 120.0
+MUTATION_WINDOW_S = 86400
+MUTATIONS_MAX = 50
+# New calls here follow an administrator's logins: they are published with no unit.
+ADMIN_UNITS = ("user.slice", "ssh.service", "systemd-logind.service")
 MAX_NR = 512
 OTHER = "other"
 # every call systemd knows, not a group of them
 _NOT_A_GROUP = ("@known",)
+# A first call is loud when it reaches past what an ordinary service does: a call systemd's
+# @system-service leaves out, a privileged or uid/gid one, a new program, another process's
+# memory, a namespace. The rest (a first brk, a first readlinkat) is quiet.
+_LOUD_GROUPS = ("@privileged", "@setuid")
+_LOUD_CALLS = frozenset({"execve", "execveat", "memfd_create", "process_vm_readv", "process_vm_writev",
+                         "process_madvise", "setns", "unshare", "userfaultfd"})
 _UNIT_SUFFIXES = (".service", ".scope", ".socket", ".mount", ".swap", ".slice")
 _UNFILTERED_SUFFIXES = (".slice", ".scope")
 _DIGITS = re.compile(r"\d+")
 _UNIT_NAME = re.compile(r"[A-Za-z0-9_.@:-]{1,64}")
+_CALL_NAME = re.compile(r"[a-z0-9_]{1,32}")
 _SCMP_ARCH_NATIVE = 0
 _SECCOMP_MODES = {"0": "none", "1": "strict", "2": "filter"}
 
-_cache = {"names": None, "chromosomes": None, "snapshot": (None, None), "filters": {}}
+_cache = {"names": None, "chromosomes": None, "snapshot": (None, None), "filters": {}, "genes": (None, None)}
 
 
 def public_unit(cgroup_path):
@@ -118,8 +135,30 @@ def build_chromosomes(groups, native):
     return chromosomes
 
 
-def chromosomes():
-    if _cache["chromosomes"] is None:
+def group_calls(groups, name, seen=None):
+    """A group's calls with those of its subgroups."""
+    seen = set() if seen is None else seen
+    if name in seen or name not in groups:
+        return set()
+    seen.add(name)
+    calls = set(groups[name]["calls"])
+    for sub in groups[name]["groups"]:
+        calls |= group_calls(groups, sub, seen)
+    return calls
+
+
+def loud_calls(groups, native):
+    """The calls of this architecture whose first use by a unit is a loud mutation."""
+    if "@system-service" not in groups:
+        return sorted(_LOUD_CALLS & native)
+    quiet = group_calls(groups, "@system-service") - _LOUD_CALLS
+    for name in _LOUD_GROUPS:
+        quiet -= group_calls(groups, name)
+    return sorted(native - quiet)
+
+
+def _groups():
+    if _cache.get("groups") is None:
         try:
             text = subprocess.run(
                 ["systemd-analyze", "syscall-filter", "--no-pager"],
@@ -127,8 +166,20 @@ def chromosomes():
             ).stdout
         except (OSError, subprocess.SubprocessError):
             text = ""
-        _cache["chromosomes"] = build_chromosomes(parse_groups(text), set(syscall_names().values()))
+        _cache["groups"] = parse_groups(text)
+    return _cache["groups"]
+
+
+def chromosomes():
+    if _cache["chromosomes"] is None:
+        _cache["chromosomes"] = build_chromosomes(_groups(), set(syscall_names().values()))
     return _cache["chromosomes"]
+
+
+def loud():
+    if _cache.get("loud") is None:
+        _cache["loud"] = frozenset(loud_calls(_groups(), set(syscall_names().values())))
+    return _cache["loud"]
 
 
 def fold_units(payload):
@@ -240,16 +291,89 @@ def _unit_filter(real):
     return state
 
 
+def _genes():
+    """The gene watch's mutations as (unit, call, time), newest first, and since when it
+    has been learning; None while it is not running."""
+    try:
+        stat = os.stat(GENES_SNAPSHOT)
+    except OSError:
+        return None
+    if time.time() - stat.st_mtime > GENES_MAX_AGE_S:
+        return None
+    mtime, document = _cache.get("genes", (None, None))
+    if mtime == stat.st_mtime and document is not None:
+        return document
+    try:
+        with open(GENES_SNAPSHOT, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
+        return None
+    events = []
+    for event in payload["events"]:
+        if not isinstance(event, dict):
+            continue
+        unit, call, at = event.get("unit"), event.get("call"), event.get("t")
+        if (isinstance(unit, str) and _UNIT_NAME.fullmatch(unit) and isinstance(call, str)
+                and _CALL_NAME.fullmatch(call) and isinstance(at, (int, float))):
+            events.append((unit, call, float(at)))
+    events.sort(key=lambda event: -event[2])
+    since, until = payload.get("since"), payload.get("learning_until")
+    document = {"since": float(since) if isinstance(since, (int, float)) else None,
+                "learning_until": float(until) if isinstance(until, (int, float)) else None, "events": events}
+    _cache["genes"] = (stat.st_mtime, document)
+    return document
+
+
+def _recent_mutations(genes, now):
+    return [event for event in genes["events"] if 0 <= now - event[2] <= MUTATION_WINDOW_S] if genes else []
+
+
+def _mutations_view(genes, now):
+    if genes is None:
+        return {"available": False}
+    recent = _recent_mutations(genes, now)
+    loud_set = loud()
+    rows = []
+    for unit, call, at in recent[:MUTATIONS_MAX]:
+        admin = unit in ADMIN_UNITS
+        rows.append({"unit": None if admin else unit, **({"admin": True} if admin else {}),
+                     "call": call, "loud": call in loud_set, "age": max(0, round(now - at))})
+    since, until = genes["since"], genes["learning_until"]
+    return {
+        "available": True,
+        "since": datetime.fromtimestamp(since, tz=timezone.utc).isoformat() if since else None,
+        "learning_until": datetime.fromtimestamp(until, tz=timezone.utc).isoformat() if until and until > now else None,
+        "window_s": MUTATION_WINDOW_S,
+        "count": len(recent),
+        "loud_count": sum(1 for _, call, _ in recent if call in loud_set),
+        "events": rows,
+    }
+
+
 def _unavailable(reason):
     return {"available": False, "units": [], "source": {"kind": "ebpf", "reason": reason}}
 
 
-def get_units():
-    """Every unit seen, busiest first, with the chromosomes their calls fall into."""
+def get_units(at=None):
+    """Every unit seen, busiest first, with the chromosomes their calls fall into.
+
+    ``at`` (epoch seconds, for playback) moves the day of mutations back to end there;
+    the counts are the sensor's, which keeps no history, so they stay as of now."""
     document, reason = _snapshot()
     if document is None:
-        return {**_unavailable(reason), "chromosomes": chromosomes()}
+        return {**_unavailable(reason), "chromosomes": chromosomes(), "loud_calls": sorted(loud())}
     now = time.time()
+    then = now if at is None else max(now - MUTATION_WINDOW_S * 7, min(float(at), now))
+    genes = _genes()
+    loud_set = loud()
+    mutated, loudly = {}, {}
+    for unit, call, _ in _recent_mutations(genes, then):
+        if unit not in ADMIN_UNITS:
+            mutated[unit] = mutated.get(unit, 0) + 1
+            if call in loud_set:
+                loudly[unit] = loudly.get(unit, 0) + 1
     rows = []
     for unit, entry in document["units"].items():
         calls = entry["calls"].values()
@@ -258,6 +382,8 @@ def get_units():
             "distinct": len(entry["calls"]),
             "calls": sum(count for count, _ in calls),
             "recent": sum(1 for _, moved in calls if now - moved <= RECENT_S),
+            "mutations": mutated.get(unit, 0),
+            "loud": loudly.get(unit, 0),
         })
     rows.sort(key=lambda row: -row["calls"])
     return {
@@ -267,7 +393,10 @@ def get_units():
         "recent_s": RECENT_S,
         "units": rows,
         "chromosomes": chromosomes(),
-        "source": {"kind": "ebpf", "scope": "machine", "fields": "units, syscall names, counts"},
+        "loud_calls": sorted(loud_set),
+        "mutations": _mutations_view(genes, then),
+        **({"at": round(then, 3)} if at is not None else {}),
+        "source": {"kind": "ebpf", "scope": "machine", "fields": "units, syscall names, counts, first calls"},
     }
 
 
@@ -290,6 +419,10 @@ def get_unit(unit):
     ]
     real = entry["real"]
     unit_filter = _unit_filter(real) if real and not real.endswith(_UNFILTERED_SUFFIXES) else None
+    genes = _genes()
+    mutations = [] if unit in ADMIN_UNITS else [
+        [call, max(0, round(now - at))] for name, call, at in _recent_mutations(genes, now) if name == unit
+    ]
     return {
         "available": True,
         "unit": unit,
@@ -298,5 +431,7 @@ def get_unit(unit):
         "recent_s": RECENT_S,
         "calls": calls,
         "filter": unit_filter,
-        "source": {"kind": "ebpf", "scope": "machine", "fields": "syscall names, counts, filter kind and size"},
+        "mutations": mutations if genes is not None else None,
+        "source": {"kind": "ebpf", "scope": "machine",
+                   "fields": "syscall names, counts, filter kind and size, first calls"},
     }

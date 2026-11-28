@@ -245,6 +245,15 @@ class MLConfig:
     )
     http_mlflow_model: str = os.getenv("KERNEL_AI_ML_HTTP_MODEL", "kernel_dna_http_attempt")
 
+    # --- Syscall genes (kernel_ai/ml/genes.py) ---
+    # A unit's first call of a name it never made; reads the sensor's per-cgroup counts
+    # and writes only its own state and a snapshot for the karyotype API.
+    enable_genes: bool = os.getenv("KERNEL_AI_ML_GENES", "true").lower() == "true"
+    genes_state_path: str = os.getenv(
+        "KERNEL_AI_ML_GENES_STATE",
+        str(_DATA_DIR / "syscall_genes.json"),
+    )
+
     @property
     def alpha(self) -> float:
         return 2.0 / (max(2, self.baseline_window) + 1.0)

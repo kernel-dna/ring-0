@@ -93,6 +93,72 @@ def test_kernel_events_rejects_invalid_pid_filter(client):
     assert resp.status_code == 400
 
 
+def test_kernel_events_serves_an_alert_fragment_from_the_security_stream_only(client, monkeypatch):
+    from kernel_ai.services import kernel_events as kernel_events_service
+
+    monkeypatch.setattr(kernel_events_service, "_immune_alerts", lambda: {
+        "a1": {"units": ["kernel-ai.service"], "calls": [[5, "accept4", 0, 2]], "at": 5}})
+
+    ok = client.get("/api/kernel-events?stream=security&alert=a1")
+    assert ok.status_code == 200
+    assert ok.get_json()["events"] == [{"seq": 5, "syscall": "accept4", "unit": "kernel-ai.service", "lane": 2}]
+    assert client.get("/api/kernel-events?alert=a1").status_code == 400
+    assert client.get("/api/kernel-events?stream=security&alert=a/1").status_code == 400
+
+
+def test_kernel_events_tells_a_loopback_requester_its_port_and_takes_it_back(client, monkeypatch):
+    from kernel_ai.services import kernel_events as kernel_events_service
+
+    asked = []
+    monkeypatch.setattr(kernel_events_service, "get_kernel_events",
+                        lambda **kwargs: asked.append(kwargs["mine"]) or {"available": True, "events": []})
+    nginx = {"REMOTE_ADDR": "127.0.0.1", "REMOTE_PORT": "51234"}
+
+    ok = client.get("/api/kernel-events?stream=security&mine=51230,51232", environ_base=nginx)
+    assert ok.status_code == 200
+    assert ok.get_json()["you"] == 51234
+    assert asked == [[51230, 51232]]
+    assert "you" not in client.get("/api/kernel-events", environ_base=nginx).get_json()
+    outside = {"REMOTE_ADDR": "203.0.113.9", "REMOTE_PORT": "40000"}
+    assert "you" not in client.get("/api/kernel-events?stream=security", environ_base=outside).get_json()
+    for mine in ("x", "0", "65536", ",".join(["1"] * 33)):
+        assert client.get(f"/api/kernel-events?stream=security&mine={mine}").status_code == 400
+
+
+def test_kernel_events_marks_the_connection_nginx_reports(client, monkeypatch):
+    from kernel_ai.services import kernel_events as kernel_events_service
+
+    asked = []
+    monkeypatch.setattr(kernel_events_service, "get_kernel_events",
+                        lambda **kwargs: asked.append(kwargs["conns"]) or {"available": True, "events": []})
+    nginx = {"REMOTE_ADDR": "127.0.0.1", "REMOTE_PORT": "51234"}
+
+    ok = client.get("/api/kernel-events?stream=security&conns=40002", environ_base=nginx,
+                    headers={"X-Client-Port": "40000"})
+    assert ok.status_code == 200
+    assert ok.get_json()["you_conn"] == 40000
+    assert asked == [[40002, 40000]]
+    outside = {"REMOTE_ADDR": "203.0.113.9", "REMOTE_PORT": "40000"}
+    for environ, header in [(outside, "40000")] + [(nginx, h) for h in ("", "0", "65536", "4e4", "-1", "+400", "123456")]:
+        asked.clear()
+        reply = client.get("/api/kernel-events?stream=security", environ_base=environ, headers={"X-Client-Port": header})
+        assert "you_conn" not in reply.get_json() and asked == [[]], header
+    latency = client.get("/api/kernel-events", environ_base=nginx, headers={"X-Client-Port": "40000"})
+    assert "you_conn" not in latency.get_json()
+    for conns in ("x", "0", "65536", ",".join(["1"] * 9)):
+        assert client.get(f"/api/kernel-events?stream=security&conns={conns}").status_code == 400
+
+
+def test_process_lineage_reads_traits_only_when_asked(client, monkeypatch):
+    asked = []
+    monkeypatch.setattr(process_handlers._process_inspect_service, "get_process_lineage_info",
+                        lambda pid, traits=False: asked.append((pid, traits)) or {"pid": pid, "chain": []})
+
+    for query in ("?traits=1", "", "?traits=0", "?traits=yes"):
+        assert client.get(f"/api/process/77/lineage{query}").status_code == 200
+    assert asked == [(77, True), (77, False), (77, False), (77, False)]
+
+
 def test_process_identity_view_uses_lightweight_snapshot(client, monkeypatch):
     monkeypatch.setattr(
         process_handlers._processes_service,

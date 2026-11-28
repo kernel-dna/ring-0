@@ -307,3 +307,53 @@ def test_stage8_announces_a_quarantine_once_not_once_per_tick():
     assert tracker.is_quarantined(41) is True
     # Still not learning from it after the first verdict.
     assert tracker.drain_pending() == {}
+
+
+def _context_model():
+    m = MarkovScorer()
+    m.observe_pair("accept4", "bind", "nginx", weight=10_000)
+    m.observe_pair("bind", "accept4", "nginx", weight=10_000)
+    m.observe_pair("accept4", "clone", "systemd", weight=50)
+    m.observe_pair("clone", "accept4", "systemd", weight=50)
+    return m
+
+
+def test_context_learns_what_the_global_row_drowns():
+    from kernel_ai.ml.sequence_deep.markov import comm_context
+
+    m = _context_model()
+    window = ["accept4", "clone"] * 8
+    flat = m.score_window(window)["neg_avg_logprob"]
+    ctx = m.score_window(window, context=comm_context("systemd"))["neg_avg_logprob"]
+    assert flat > 2.0 and ctx < 0.5
+    # A context never seen scores exactly like the global model.
+    assert m.score_window(window, context="python")["neg_avg_logprob"] == flat
+    # Another process doing systemd's thing is still unusual for *it*.
+    assert m.score_window(window, context="nginx")["neg_avg_logprob"] > 3.0
+
+
+def test_context_survives_save_and_reload():
+    m = _context_model()
+    again = MarkovScorer.from_state(m.state_dict())
+    window = ["accept4", "clone", "accept4"]
+    assert again.score_window(window, context="systemd") == m.score_window(window, context="systemd")
+    assert again.contextual
+
+
+def test_comm_context_folds_numbered_workers():
+    from kernel_ai.ml.sequence_deep.markov import comm_context
+
+    assert comm_context("kworker/0:1") == comm_context("kworker/3:2") == "kworker/:"
+    assert comm_context("(python)") == comm_context("python3") == "python"
+    assert comm_context("") is None and comm_context("123") is None
+
+
+def test_unit_context_takes_the_innermost_unit():
+    from kernel_ai.ml.sequence_deep.markov import unit_context
+
+    assert unit_context("system.slice/nginx.service") == "unit:nginx.service"
+    assert unit_context("user.slice/user-1000.slice/session-41.scope") == "unit:session-.scope"
+    assert unit_context("system.slice/system-sshd.slice/ssh@12-172.31.0.1:22-1.2.3.4:5555.service") \
+        == "unit:ssh@.service"
+    assert unit_context("") == "unit:-.slice"
+    assert unit_context(None) is None

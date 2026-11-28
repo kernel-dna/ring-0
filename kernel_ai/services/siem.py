@@ -26,9 +26,7 @@ from datetime import datetime, timezone
 
 from kernel_ai.services import kernel_events as _kernel_events
 
-# PROD default; local/dev can override with KERNEL_AI_ES_ENV_FILE or export
-# KERNEL_AI_ES_URL / KERNEL_AI_ES_API_KEY directly (no file required).
-_ENV_PATH = os.environ.get("KERNEL_AI_ES_ENV_FILE", "/etc/kernel-ai/elastic.env")
+_ENV_PATH = "/etc/kernel-ai/elastic.env"
 _CACHE_TTL_SEC = 45.0
 
 _cache_lock = threading.Lock()
@@ -216,14 +214,19 @@ def _empty(hours: int, reason: str = "") -> dict:
     }
 
 
-def get_siem_alerts(hours: int = 24, limit: int = 120) -> dict:
+def get_siem_alerts(hours: int = 24, limit: int = 120, until: float | None = None) -> dict:
     """Return recent SIEM detection alerts, normalized and cached.
 
+    ``until`` (epoch seconds) asks for the ``hours`` before that moment instead of before
+    now, for playback; it is taken to the minute so a moving clock shares the cache.
     Fails soft: returns available=False on any misconfiguration or error.
     """
     hours = max(1, min(int(hours), 24 * 30))
     limit = max(1, min(int(limit), 500))
-    cache_key = (hours, limit)
+    if until is not None:
+        wall = time.time()
+        until = int(max(wall - 30 * 86400, min(float(until), wall)) // 60 * 60)
+    cache_key = (hours, limit, until)
 
     now = time.monotonic()
     with _cache_lock:
@@ -242,7 +245,9 @@ def get_siem_alerts(hours: int = 24, limit: int = 120) -> dict:
         "query": {
             "bool": {
                 "filter": [
-                    {"range": {"@timestamp": {"gte": f"now-{hours}h"}}},
+                    {"range": {"@timestamp": {"gte": f"now-{hours}h"}} if until is None else
+                     {"@timestamp": {"gte": (until - hours * 3600) * 1000, "lte": until * 1000,
+                                     "format": "epoch_millis"}}},
                     {"term": {"kibana.alert.rule.tags": cfg["tag"]}},
                 ]
             }
@@ -308,8 +313,12 @@ def get_siem_alerts(hours: int = 24, limit: int = 120) -> dict:
         "by_tactic": by_tactic,
         "alerts": alerts,
         "timeline": _timeline(res),
+        **({"until": until} if until is not None else {}),
     }
 
     with _cache_lock:
+        # a played-back clock asks for a new minute each time; expired ones go
+        for key in [key for key, entry in _cache.items() if entry[0] <= now]:
+            del _cache[key]
         _cache[cache_key] = (now + _CACHE_TTL_SEC, payload)
     return payload

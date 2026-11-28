@@ -40,6 +40,63 @@ STAGE4_GRID = (0.10, 0.20, 0.30, 0.40, 0.55)
 STAGE8_GRID = (4.0, 5.0, 6.0, 6.5, 7.0, 7.5, 8.0, 9.0)
 WORST_GRID = (8.0, 10.0, 12.0, 14.0, 16.0, 18.0)
 
+# Token alphabets. "name" is what the worker sees. "class" adds where a connect or bind goes
+# and where an exec comes from, read from the security socket's sockaddr and path (recorded
+# since 2026-11-21 16:37 on PROD); "port" adds the port below the ephemeral range as well.
+# accept/accept4 stay bare: their peer is only published since 2026-11-24.
+TOKENS = ("name", "class", "port")
+_EPHEMERAL = 32768
+_FAMILIES = {"unix": "unix", "netlink": "nl", "38": "alg", "unspec": "unspec", "packet": "packet"}
+_EXEC_DIRS = (
+    (("/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/"), "sys"),
+    (("/usr/local/",), "local"),
+    (("/usr/lib/", "/usr/libexec/", "/lib/", "/usr/share/"), "lib"),
+    (("/proc/", "/dev/fd/", "memfd:"), "fd"),
+    (("/tmp/", "/var/tmp/", "/dev/shm/", "/run/user/", "/run/shm/"), "tmp"),
+    (("/home/", "/root/"), "home"),
+    (("/etc/",), "etc"),
+    (("/opt/", "/snap/"), "opt"),
+)
+
+
+def _loopback(addr: str) -> bool:
+    return addr.startswith(("127.", "::ffff:127.")) or addr == "::1"
+
+
+def exec_class(path) -> str:
+    """Where a program comes from; an exec without a path (execveat on an fd) is ``fd``."""
+    if not path:
+        return "fd"
+    path = str(path)
+    for prefixes, name in _EXEC_DIRS:
+        if path.startswith(prefixes):
+            return name
+    return "other" if path.startswith("/") else "rel"
+
+
+def arg_token(span: dict, name: str, tokens: str) -> str:
+    if tokens == "name":
+        return name
+    if name in ("execve", "execveat"):
+        return f"{name}:{exec_class(span.get('path'))}"
+    if name not in ("connect", "bind"):
+        return name
+    sa = span.get("sockaddr")
+    if not isinstance(sa, dict):
+        return name
+    family = str(sa.get("family") or "")
+    if family not in ("inet", "inet6"):
+        return f"{name}:{_FAMILIES.get(family, 'other')}"
+    addr = str(sa.get("addr") or "")
+    where = "lo" if _loopback(addr) else "any" if addr in ("", "0.0.0.0", "::") else "out"
+    if tokens != "port":
+        return f"{name}:{where}"
+    try:
+        port = int(sa.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    return f"{name}:{where}:{port if port < _EPHEMERAL else 'eph'}"
+
 
 def _epoch(ts: str) -> float | None:
     """RFC3339Nano from the sensor; 3.10's fromisoformat takes neither Z nor ns."""
@@ -69,12 +126,14 @@ def _context(obj: dict, comm: str, mode: str, cgroups: dict[int, str] | None) ->
 
 
 def to_event(
-    obj: dict, *, context: str = "comm", cgroups: dict[int, str] | None = None
+    obj: dict, *, context: str = "comm", cgroups: dict[int, str] | None = None,
+    tokens: str = "name",
 ) -> ReplayEvent | None:
     """KernelEventV1 → ReplayEvent, filtered like the collector's sensor mode.
 
     ``context="unit"`` keys the event by its systemd unit when the day's
-    cgroups.json knows the id, and by comm otherwise.
+    cgroups.json knows the id, and by comm otherwise. ``tokens`` picks the
+    alphabet (see ``TOKENS``).
     """
     if obj.get("kind") != "syscall_span":
         return None
@@ -94,7 +153,7 @@ def to_event(
             pid=int(obj.get("pid") or 0),
             uid=int(obj.get("uid") or 0),
             comm=comm,
-            syscall=name[:64],
+            syscall=arg_token(span, name[:64], tokens),
             context=_context(obj, comm, context, cgroups),
         )
     except (TypeError, ValueError):
@@ -119,6 +178,7 @@ def iter_dataset_events(
     context: str = "comm",
     exclude: "WindowIndex | None" = None,
     on_excluded: Callable[["Window", dict, bytes, str], None] | None = None,
+    tokens: str = "name",
 ) -> Iterator[ReplayEvent]:
     """Events of the recorded days, minus those inside an alert window.
 
@@ -139,7 +199,7 @@ def iter_dataset_events(
                 obj = json.loads(line)
             except ValueError:
                 continue
-            ev = to_event(obj, context=context, cgroups=maps[day]) if isinstance(obj, dict) else None
+            ev = to_event(obj, context=context, cgroups=maps[day], tokens=tokens) if isinstance(obj, dict) else None
             if ev is None:
                 continue
             if exclude is not None:
@@ -358,7 +418,8 @@ def summarize(res: ReplayResult, cfg) -> dict:
     }
 
 
-def score_traces(paths: list[str], cfg, *, stide, deep, context: str = "comm") -> dict[str, dict]:
+def score_traces(paths: list[str], cfg, *, stide, deep, context: str = "comm",
+                 tokens: str = "name") -> dict[str, dict]:
     """Best Stage 4 / Stage 8 score each attack trace reaches on its own.
 
     Scoring is per pid, so a trace scores the same alone as mixed into a busy
@@ -376,7 +437,7 @@ def score_traces(paths: list[str], cfg, *, stide, deep, context: str = "comm") -
             cgroups = {}
         with open(path, encoding="utf-8") as fh:
             for line in fh:
-                ev = to_event(json.loads(line), context=context, cgroups=cgroups)
+                ev = to_event(json.loads(line), context=context, cgroups=cgroups, tokens=tokens)
                 if ev is not None:
                     evs.append(ev)
         evs.sort(key=lambda e: e.ts)
@@ -411,6 +472,8 @@ def main() -> None:
     ap.add_argument("--context", choices=("comm", "unit"), default="comm",
                     help="Stage 8 context key (unit needs cgroups.json per day)")
     ap.add_argument("--exclude", help="alerts JSON from `exclusions fetch`: replay without their windows")
+    ap.add_argument("--tokens", choices=TOKENS,
+                    help="token alphabet (default: the Markov artifact's, else name)")
     args = ap.parse_args()
 
     cfg = MLConfig()
@@ -423,6 +486,10 @@ def main() -> None:
         deep = DeepSequenceScorer(cfg)
         if not deep.ready:
             raise SystemExit(f"Markov artifact not usable: {args.markov}")
+    trained = deep.markov.meta.get("tokens", "name") if deep is not None else None
+    tokens = args.tokens or trained or "name"
+    if trained is not None and tokens != trained:
+        raise SystemExit(f"--tokens {tokens}: the Markov artifact was trained on {trained} tokens")
 
     index = None
     excluded: Counter = Counter()
@@ -432,16 +499,16 @@ def main() -> None:
         index = WindowIndex.from_alerts(args.exclude)
     events = iter_dataset_events(
         args.data, args.days, context=args.context, exclude=index,
-        on_excluded=lambda w, *_: excluded.update(w.labels[:1]),
+        on_excluded=lambda w, *_: excluded.update(w.labels[:1]), tokens=tokens,
     )
     res = replay(events, cfg, stide=stide, deep=deep)
-    summary = summarize(res, cfg)
+    summary = {"tokens": tokens, **summarize(res, cfg)}
     if index is not None:
         summary["excluded"] = {"windows": len(index), "events": sum(excluded.values()),
                                "by_label": dict(excluded.most_common())}
     if args.attacks:
         summary["attacks"] = score_traces(
-            args.attacks, cfg, stide=stide, deep=deep, context=args.context
+            args.attacks, cfg, stide=stide, deep=deep, context=args.context, tokens=tokens
         )
     print(json.dumps(summary, indent=1, ensure_ascii=False))
 

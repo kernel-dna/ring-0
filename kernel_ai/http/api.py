@@ -17,12 +17,10 @@ from kernel_ai.http.api_handlers.kernel import (
     slabinfo,
     sentry_test,
     siem_alerts,
-    socket_activity,
     syscall_detail,
     syscalls_realtime,
     wakeups,
 )
-from kernel_ai.http.api_handlers.genome import syscall_genome
 from kernel_ai.http.api_handlers.network_system import (
     active_connections,
     devices_realtime,
@@ -33,10 +31,8 @@ from kernel_ai.http.api_handlers.network_system import (
     isolation_context,
     flow_history,
     ip_entry,
-    network_mechanisms,
     network_stack_realtime,
     path_walk,
-    peer_distance,
     traceroute_info,
 )
 from kernel_ai.http.api_handlers.processes import (
@@ -64,6 +60,7 @@ from kernel_ai.http.api_handlers.security_logs import (
     ingest_frontend_logs,
     security_realtime,
 )
+from kernel_ai.http.api_handlers.genome import syscall_genome
 
 __all__ = [
     "active_connections",
@@ -102,10 +99,10 @@ __all__ = [
     "isolation_context",
     "kernel_data",
     "kernel_dna",
+    "syscall_genome",
     "kernel_events",
     "ml_anomalies",
     "ml_drift",
-    "network_mechanisms",
     "network_stack_realtime",
     "nginx_files",
     "process_kernel_map",
@@ -116,9 +113,7 @@ __all__ = [
     "security_realtime",
     "sentry_test",
     "siem_alerts",
-    "socket_activity",
     "syscall_detail",
-    "syscall_genome",
     "syscalls_realtime",
     "traceroute_info",
     "wakeups",

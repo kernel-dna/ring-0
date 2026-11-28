@@ -6,7 +6,6 @@ from flask import jsonify, redirect, render_template, send_from_directory
 
 from kernel_ai.config import PROJECT_ROOT
 from kernel_ai.services import core_observability as _core_observability_service
-from kernel_ai.standby import peer_is_up, standby_peer
 
 
 def get_system_info():
@@ -89,18 +88,6 @@ def linux_filesystem_subsystem_html():
     return redirect("/linux-filesystem-subsystem", code=301)
 
 
-def linux_kernel_architecture_page():
-    return render_template("linux-kernel-architecture.html")
-
-
-def linux_kernel_architecture_html():
-    return redirect("/linux-kernel-architecture", code=301)
-
-
-def architecture_page_legacy():
-    return redirect("/linux-kernel-architecture", code=301)
-
-
 def kernel_dna_page():
     return render_template("kernel-dna.html")
 
@@ -121,44 +108,11 @@ def linux_devices_subsystem_html():
     return redirect("/linux-devices-subsystem", code=301)
 
 
-def io_elevator_prototype_page():
-    """Local design prototype: vintage floor-selector as block I/O elevator."""
-    return render_template("io-elevator-prototype.html")
-
-
-def syscall_selector_prototype_page():
-    """Local design prototype: selector arms as sys_call_table dispatch."""
-    return render_template("syscall-selector-prototype.html")
-
-
-def network_path_prototype_page():
-    """Local design prototype: layers on the left, TX/RX columns, mechanism rail."""
-    return render_template("network-path-prototype.html")
-
-
-def network_hud_prototype_page():
-    """Local design prototype: HUD treatment of the packet path."""
-    return render_template("network-hud-prototype.html")
-
-
-def kernel_cutaway_probe_page():
-    """Local design probe: isometric cutaway rendering technique, no live data."""
-    return render_template("kernel-cutaway-probe.html")
-
-
 def health_check():
-    body = {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "system_info": get_system_info(),
-    }
-    peer = standby_peer()
-    if not peer:
-        return jsonify(body)
-    body["role"] = "standby"
-    if peer_is_up(peer):
-        body["status"] = "standby"
-        body["peer"] = "up"
-        return jsonify(body), 503
-    body["peer"] = "down"
-    return jsonify(body)
+    return jsonify(
+        {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "system_info": get_system_info(),
+        }
+    )
